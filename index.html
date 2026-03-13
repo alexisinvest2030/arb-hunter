@@ -675,6 +675,15 @@ const _bridgeQuoteCache = {};
 let BRIDGE_QUOTE_TTL  = 60000; // ms — refresh la fiecare 60s (evităm 429 rate limit)
 
 // Chain IDs pentru Relay.link API
+// MEV Protection RPCs — tranzacții private, bypass mempool public
+const MEV_RPCS = {
+  arb:  'https://rpc.flashbots.net/fast?hint=calldata&hint=logs&hint=default_logs', // Flashbots Protect
+  base: 'https://rpc.mevblocker.io',   // MEV Blocker
+  op:   'https://rpc.mevblocker.io',   // MEV Blocker
+  poly: 'https://rpc.mevblocker.io',   // MEV Blocker (Polygon suport adăugat)
+  bsc:  'https://bsc-dataseed.binance.org', // BSC — fără MEV prot nativ
+};
+
 const CHAIN_IDS = { arb:42161, base:8453, op:10, poly:137, sol:'solana' };
 // USDC addresses per chain (pentru Relay.link quote)
 const USDC_ADDR = {
@@ -1099,6 +1108,17 @@ const SWAP_TOPIC = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115f
 
 // Providers WSS per chain
 // Alchemy dacă e key disponibil (suportă file://), altfel Ankr public
+function getHeliusUrl(type) {
+  // type: 'http' sau 'wss'
+  const key = S.cfg.heliusKey || '';
+  if (!key) return type === 'wss'
+    ? 'wss://api.mainnet-beta.solana.com'
+    : 'https://api.mainnet-beta.solana.com';
+  return type === 'wss'
+    ? `wss://mainnet.helius-rpc.com/?api-key=${key}`
+    : `https://mainnet.helius-rpc.com/?api-key=${key}`;
+}
+
 function getWssUrl(chainId) {
   const key = S.cfg.alchemyKey;
   const ALCHEMY_WSS = {
@@ -2611,22 +2631,49 @@ async function switchChain(chainId) {
 }
 
 async function get1inchQuote(chainId, fromToken, toToken, amount, walletAddress, slippagePct) {
-  // 1inch Fusion API — fără API key pentru quote, cu key pentru execuție
-  // Folosim v6 quote (publică)
-  const slippageBps = Math.round(slippagePct * 100); // % → bps (0.3% → 30)
-  const url = `https://api.1inch.dev/swap/v6.0/${chainId}/swap` +
+  // 1inch API v6 — necesită API key din portal.1inch.dev (gratuit)
+  const apiKey = S.cfg.oneInchKey || '';
+  const slippagePct_num = parseFloat(slippagePct) || 0.5;
+
+  const headers = { 'Accept': 'application/json' };
+  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
+
+  // Încercăm /swap (returnează tx calldata) — necesită API key
+  // Fallback la /quote (returnează doar prețul) — public
+  const isSwap = !!apiKey;
+  const endpoint = isSwap ? 'swap' : 'quote';
+  const url = `https://api.1inch.dev/swap/v6.0/${chainId}/${endpoint}` +
     `?src=${fromToken}&dst=${toToken}&amount=${amount}` +
-    `&from=${walletAddress}&slippage=${slippageBps}&disableEstimate=false`;
-  
+    `&from=${walletAddress}&slippage=${slippagePct_num}&disableEstimate=true&allowPartialFill=false`;
+
   const r = await fetch(url, {
-    headers: { 'Accept': 'application/json' },
-    signal: AbortSignal.timeout(5000),
+    headers,
+    signal: AbortSignal.timeout(8000),
   });
+
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
+    // 401 = lipsă API key, 429 = rate limit
+    if (r.status === 401) throw new Error('1inch API key lipsă/invalid — adaugă cheia în Settings → Config → 1inch Key');
+    if (r.status === 429) throw new Error('1inch rate limit — încearcă din nou în 10s');
     throw new Error(`1inch API ${r.status}: ${err.description || err.error || 'unknown'}`);
   }
-  return r.json();
+
+  const data = await r.json();
+
+  // Normalizăm răspunsul: /swap returnează { tx, toAmount }, /quote returnează { toAmount }
+  return {
+    toAmount: data.toAmount || data.dstAmount || '0',
+    tx: data.tx || {
+      // Fără API key: construim tx manual cu datele disponibile
+      to: fromToken,  // va fi overridden la execuție
+      data: '0x',
+      value: '0',
+      gas: '300000',
+    },
+    isQuoteOnly: !isSwap,
+    priceImpact: data.estimatedGas,
+  };
 }
 
 async function execTradeLive(opp) {
@@ -2686,19 +2733,27 @@ async function execTradeLive(opp) {
     opp.slipPct,
   );
 
-  const wethOut = ethers.formatEther(quote.toAmount);
+  // Dacă nu avem API key, nu putem executa swap
+  if (quote.isQuoteOnly) {
+    throw new Error('1inch API key lipsă — adaugă cheia în Settings → CONFIG → 1inch Key (portal.1inch.dev)');
+  }
+
+  const wethOut = ethers.formatEther(BigInt(quote.toAmount || '0'));
   log('SYS', `[3/5] Quote: ${opp.cap} USDC → ${parseFloat(wethOut).toFixed(6)} WETH`);
 
-  // ── STEP 5: Executăm swap via MetaMask ─────────────────────────
-  log('SYS', `[4/5] Trimitere swap TX — confirmare MetaMask necesară...`);
+  // ── STEP 5: Executăm swap via MEV-protected RPC ───────────────
+  log('SYS', `[4/5] Trimitere swap TX cu MEV protection...`);
 
-  // Gas live pentru tx
+  // Folosim MEV-protected RPC dacă e disponibil pentru chain-ul sursă
+  const mevRpc = MEV_RPCS[opp.src.id];
+  let swapTx, receipt;
+
   const feeData = await provider.getFeeData();
   const txParams = {
     to:       quote.tx.to,
     data:     quote.tx.data,
     value:    BigInt(quote.tx.value || 0),
-    gasLimit: BigInt(Math.ceil(parseInt(quote.tx.gas || 300000) * 1.2)), // +20% buffer
+    gasLimit: BigInt(Math.ceil(parseInt(quote.tx.gas || 300000) * 1.2)),
     ...(feeData.maxFeePerGas ? {
       maxFeePerGas:         feeData.maxFeePerGas,
       maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
@@ -2707,12 +2762,38 @@ async function execTradeLive(opp) {
     }),
   };
 
-  const swapTx = await signer.sendTransaction(txParams);
-  log('TRADE', `[4/5] 🚀 Swap TX trimis: ${swapTx.hash}`);
-  log('SYS', `Aștept confirmare on-chain...`);
+  if (mevRpc && S.cfg.mev) {
+    // Trimitem prin MEV-protected RPC (Flashbots/MEVBlocker)
+    log('SYS', `[4/5] 🛡️ MEV Protection: ${mevRpc.split('/')[2]}`);
+    try {
+      // Semnăm local cu MetaMask, trimitem prin MEV RPC
+      const signedTx = await signer.signTransaction({
+        ...txParams,
+        chainId: srcChainId,
+        nonce: await provider.getTransactionCount(_connectedAddress),
+      });
+      const mevProvider = new ethers.JsonRpcProvider(mevRpc);
+      const txResp = await mevProvider.broadcastTransaction(signedTx);
+      swapTx = txResp;
+      log('TRADE', `[4/5] 🚀 TX trimis prin MEV RPC: ${swapTx.hash}`);
+      // Așteptăm confirmarea pe provider-ul normal (MEV RPC nu suportă wait)
+      receipt = await provider.waitForTransaction(swapTx.hash, 1, 60000);
+    } catch(mevErr) {
+      // Fallback la MetaMask normal dacă MEV RPC eșuează
+      log('WARN', `MEV RPC error: ${mevErr.message} — fallback la MetaMask standard`);
+      swapTx = await signer.sendTransaction(txParams);
+      log('TRADE', `[4/5] 🚀 Swap TX (standard): ${swapTx.hash}`);
+      receipt = await swapTx.wait(1);
+    }
+  } else {
+    // Trimitere standard prin MetaMask
+    log('SYS', `[4/5] Trimitere standard — confirmare MetaMask necesară...`);
+    swapTx = await signer.sendTransaction(txParams);
+    log('TRADE', `[4/5] 🚀 Swap TX trimis: ${swapTx.hash}`);
+    receipt = await swapTx.wait(1);
+  }
 
-  const receipt = await swapTx.wait(1);
-  if (receipt.status !== 1) throw new Error('Swap TX revertit on-chain');
+  if (!receipt || receipt.status !== 1) throw new Error('Swap TX revertit on-chain');
   log('TRADE', `[4/5] ✅ Swap confirmat în block #${receipt.blockNumber}`);
 
   // ── STEP 6: Inițiere bridge ────────────────────────────────────
@@ -3360,6 +3441,26 @@ function renderSettings() {
       </div>
       <div style="font-size:9px;color:var(--dim);margin-top:3px">
         Gratuit la <span style="color:var(--cyan)">alchemy.com</span> · 30M CU/lună incluse
+      </div>
+    </div>
+
+    <!-- 1INCH API KEY ─────────────────────────────────────────── -->
+    <div style="background:rgba(255,50,50,.04);border:1px solid rgba(255,50,50,.2);border-radius:6px;padding:10px;margin-bottom:10px">
+      <div style="font-size:9px;color:var(--red);letter-spacing:1px;margin-bottom:6px">🔴 1INCH API KEY — SWAP EXECUȚIE LIVE</div>
+      <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
+        <input id="oneInchKeyInput" type="password"
+          style="flex:1;background:var(--bg2);border:1px solid var(--brd);border-radius:4px;padding:5px 8px;color:var(--fg);font-size:11px;font-family:monospace"
+          placeholder="Paste API key de la portal.1inch.dev..."
+          value="${S.cfg.oneInchKey || ''}"
+          oninput="update1inchKey(this.value)"
+        />
+        <button onclick="test1inchKey()" style="padding:4px 10px;background:rgba(255,50,50,.2);border:1px solid var(--red);border-radius:4px;color:var(--red);cursor:pointer;font-size:10px">TEST</button>
+      </div>
+      <div id="oneInchKeyStatus" style="font-size:9px;color:var(--dim);margin-bottom:3px">
+        ${S.cfg.oneInchKey ? '✓ Cheie setată — execuție live activă' : '⚠ Fără cheie: quote disponibil, swap dezactivat'}
+      </div>
+      <div style="font-size:9px;color:var(--dim)">
+        Gratuit la <span style="color:var(--red)">portal.1inch.dev</span> · 10k req/lună incluse
       </div>
     </div>
 
