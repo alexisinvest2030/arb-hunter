@@ -378,7 +378,8 @@ a{color:var(--purple);}a:hover{color:var(--cyan);}
       <div class="tab"    id="tab_bridges"   onclick="goTab('bridges')">🌉 Bridges</div>
       <div class="tab"    id="tab_feeds"     onclick="goTab('feeds')">📡 Feeds</div>
       <div class="tab"    id="tab_liveready" onclick="goTab('liveready')">🔴 Live</div>
-      <div class="tab"    id="tab_settings"  onclick="goTab('settings')">⚙ Config</div>
+      <div class="tab"    id="tab_balances"  onclick="goTab('balances')">💰 Balanțe</div>
+    <div class="tab"    id="tab_settings"  onclick="goTab('settings')">⚙ Config</div>
     </div>
 
     <!-- OPPS -->
@@ -438,7 +439,9 @@ a{color:var(--purple);}a:hover{color:var(--cyan);}
     </div>
 
     <!-- SETTINGS -->
-    <div id="pane_settings" style="flex:1;overflow:auto;display:none;" class="section">
+    
+<div class="section" id="pane_balances" style="display:none"><div id="balancesPaneContent" style="padding:8px"></div></div>
+<div id="pane_settings" style="flex:1;overflow:auto;display:none;" class="section">
       <div id="settingsContent"></div>
     </div>
 
@@ -493,6 +496,8 @@ var activePane='opps';  // var (nu let) — hoisted, accesibil din onclick HTML
 // ══════════════════════════════════════════════════════════════
 //  GLOBAL STATE — single source of truth
 // ══════════════════════════════════════════════════════════════
+let liveMode = false; // false=SIM, true=LIVE — toggled de toggleLiveMode()
+
 const S = {
   running: false,
   pnl:0, gross:0, gas:0,
@@ -700,6 +705,15 @@ const _bridgeQuoteCache = {};
 let BRIDGE_QUOTE_TTL  = 60000; // ms — refresh la fiecare 60s (evităm 429 rate limit)
 
 // Chain IDs pentru Relay.link API
+// MEV Protection RPCs — tranzacții private, bypass mempool public
+const MEV_RPCS = {
+  arb:  'https://rpc.flashbots.net/fast',
+  base: 'https://rpc.mevblocker.io',
+  op:   'https://rpc.mevblocker.io',
+  poly: 'https://rpc.mevblocker.io',
+  bsc:  'https://bsc-dataseed.binance.org',
+};
+
 const CHAIN_IDS = { arb:42161, base:8453, op:10, poly:137, sol:'solana' };
 // USDC addresses per chain (pentru Relay.link quote)
 const USDC_ADDR = {
@@ -905,6 +919,8 @@ const PAIRS = [
 // ══════════════════════════════════════════════════════════════
 const PX = {}; // PX[chainId][pairId] = number
 let realEth = null, realSol = null, realLink = null;
+let realMatic = 0.55, realBnb = 600.0, realBtc = 67000, realCake = 2.2;
+
 
 function initPrices() {
   CHAINS.forEach(ch => {
@@ -1354,16 +1370,20 @@ async function fetchCG() {
     realEth  = d.ethereum?.usd  || 2485;
     realSol  = d.solana?.usd    || 155;
     realLink = d.chainlink?.usd || 14.5;
+    realBnb   = d.binancecoin?.usd          || 600;
+    realMatic = d['matic-network']?.usd     || 0.55;
+    realBtc   = d.bitcoin?.usd             || 67000;
+    realCake  = d['pancakeswap-token']?.usd || 2.2;
 
     const wstE = d['wrapped-steth']?.usd   || realEth*1.165;
     const rE   = d['rocket-pool-eth']?.usd  || realEth*1.072;
     const jito = d['jito-staked-sol']?.usd  || realSol*1.065;
     const msol = d.msol?.usd               || realSol*1.058;
 
-    const realBnb   = d.binancecoin?.usd    || 600;
+    realBnb   = d.binancecoin?.usd    || 600;
+    realMatic = d['matic-network']?.usd   || 0.55;
     const realCake  = d['pancakeswap-token']?.usd || 2.2;
     const realBtc   = d.bitcoin?.usd           || 69000;
-    const realMatic = d['matic-network']?.usd  || 0.55;
 
     PAIRS[0].base = realEth;
     PAIRS[1].base = wstE/realEth;
@@ -1373,6 +1393,10 @@ async function fetchCG() {
     PAIRS[8].base = jito/realSol;
     PAIRS[9].base = msol/realSol;
     // Perechi noi
+    realBnb   = d.binancecoin?.usd    || realBnb   || 600;
+    realMatic = d['matic-network']?.usd  || realMatic || 0.55;
+    realBtc   = d.bitcoin?.usd           || realBtc   || 67000;
+    realCake  = d['pancakeswap-token']?.usd || realCake || 2.2;
     const pBnb   = PAIRS.find(p=>p.id==='BNB/USDC');   if(pBnb)   pBnb.base   = realBnb;
     const pCake  = PAIRS.find(p=>p.id==='CAKE/USDC');  if(pCake)  pCake.base  = realCake;
     const pEthT  = PAIRS.find(p=>p.id==='ETH/USDT');   if(pEthT)  pEthT.base  = realEth;
@@ -2766,9 +2790,9 @@ async function execTradeLive(opp) {
 
 async function execTrade(opp) {
   // SAFEGUARDS
-  if (liveMode && !checkSafeguards(opp)) { S._execLock=false; return; }
+  if (S.cfg.liveMode && !checkSafeguards(opp)) { S._execLock=false; return; }
   // CONFIRMARE MANUALA
-  if (liveMode && S.cfg.manualConfirm) {
+  if (S.cfg.liveMode && S.cfg.manualConfirm) {
     const confirmed = await confirmTradeDialog(opp);
     if (!confirmed) { log('SYS','Trade anulat de utilizator'); S._execLock=false; return; }
   }
@@ -3384,6 +3408,8 @@ const MOCK_BALANCES = {
 
 function loadMockBalances() {
   Object.entries(MOCK_BALANCES).forEach(([chain, bals]) => {
+    // Nu suprascrie dacă avem deja balanțe live
+    if (S.wallet.balances[chain]?.loaded && !S.wallet.balances[chain]?.mock) return;
     S.wallet.balances[chain] = { ...bals, loaded: true, mock: true };
   });
   log('SYS', '🧪 MOCK MODE: balanțe simulate încărcate pe toate 6 chain-urile');
@@ -3391,80 +3417,95 @@ function loadMockBalances() {
 }
 
 async function loadLiveBalances(address) {
-  if (!address) return;
-  const alKey = S.cfg.alchemyKey;
-  const chains = [
-    { id: 'arb',  rpc: `https://arb-mainnet.g.alchemy.com/v2/${alKey}`,  native: 'eth',  nativeDec: 18 },
-    { id: 'base', rpc: `https://base-mainnet.g.alchemy.com/v2/${alKey}`, native: 'eth',  nativeDec: 18 },
-    { id: 'op',   rpc: `https://opt-mainnet.g.alchemy.com/v2/${alKey}`,  native: 'eth',  nativeDec: 18 },
-    { id: 'poly', rpc: `https://polygon-mainnet.g.alchemy.com/v2/${alKey}`, native: 'matic', nativeDec: 18 },
-    { id: 'bsc',  rpc: 'https://bsc-dataseed.binance.org',                native: 'bnb',  nativeDec: 18 },
+  if (!address) { log('WARN','loadLiveBalances: adresă lipsă'); return; }
+  log('SYS','\u{1F4B0} Încarc balanțe live via Alchemy pe 6 chain-uri...');
+
+  const alKey = S.cfg.alchemyKey || '';
+  const EVM_CHAINS = [
+    { id:'arb',  rpc: alKey ? 'https://arb-mainnet.g.alchemy.com/v2/'+alKey     : 'https://arb1.arbitrum.io/rpc',      native:'eth',   dec:18 },
+    { id:'base', rpc: alKey ? 'https://base-mainnet.g.alchemy.com/v2/'+alKey    : 'https://mainnet.base.org',           native:'eth',   dec:18 },
+    { id:'op',   rpc: alKey ? 'https://opt-mainnet.g.alchemy.com/v2/'+alKey     : 'https://mainnet.optimism.io',        native:'eth',   dec:18 },
+    { id:'poly', rpc: alKey ? 'https://polygon-mainnet.g.alchemy.com/v2/'+alKey : 'https://polygon-rpc.com',            native:'matic', dec:18 },
+    { id:'bsc',  rpc: 'https://bsc-dataseed1.binance.org',                                                               native:'bnb',   dec:18 },
   ];
 
-  log('SYS', `💰 Încărc balanțe live pe ${chains.length} chain-uri...`);
+  // Fetch EVM chains în paralel
+  const evmResults = await Promise.allSettled(EVM_CHAINS.map(async function(ch) {
+    const t0 = Date.now();
+    const usdcAddr = USDC_NATIVE[ch.id];
 
-  await Promise.allSettled(chains.map(async ch => {
-    try {
-      const t0 = Date.now();
-      // Fetch native balance
-      const r = await fetch(ch.rpc, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getBalance', params:[address,'latest'] }),
-        signal: AbortSignal.timeout(5000),
-      });
-      const data = await r.json();
-      const nativeBal = parseInt(data.result || '0x0', 16) / Math.pow(10, ch.nativeDec);
-      const latencyMs = Date.now() - t0;
-      S.wsLatency[ch.id] = latencyMs;
+    // Batch: native + USDC într-un singur request JSON-RPC batch
+    const batch = [
+      { jsonrpc:'2.0', id:1, method:'eth_getBalance', params:[address,'latest'] },
+      { jsonrpc:'2.0', id:2, method:'eth_call', params:[{
+          to: usdcAddr,
+          data: '0x70a08231000000000000000000000000' + address.slice(2).padStart(64,'0')
+        }, 'latest']
+      }
+    ];
+    const r = await fetch(ch.rpc, {
+      method:'POST',
+      headers:{'Content-Type':'application/json'},
+      body: JSON.stringify(batch),
+      signal: AbortSignal.timeout(7000)
+    });
+    if (!r.ok) throw new Error('HTTP '+r.status);
+    const data = await r.json();
+    const lat = Date.now() - t0;
 
-      // Fetch USDC balance
-      const usdcAddr = USDC_NATIVE[ch.id];
-      const r2 = await fetch(ch.rpc, {
-        method: 'POST',
-        headers: { 'Content-Type': 'application/json' },
-        body: JSON.stringify({
-          jsonrpc:'2.0', id:2,
-          method: 'eth_call',
-          params: [{
-            to: usdcAddr,
-            data: '0x70a08231000000000000000000000000' + address.slice(2).padStart(64, '0'),
-          }, 'latest'],
-        }),
-        signal: AbortSignal.timeout(5000),
-      });
-      const data2 = await r2.json();
-      const usdcBal = parseInt(data2.result || '0x0', 16) / 1e6;
+    // Parsăm răspunsul batch
+    const nativeHex = (Array.isArray(data) ? data.find(function(d){return d.id===1;}) : data)?.result || '0x0';
+    const usdcHex   = (Array.isArray(data) ? data.find(function(d){return d.id===2;}) : {result:'0x0'})?.result || '0x0';
 
-      S.wallet.balances[ch.id] = { [ch.native]: nativeBal, usdc: usdcBal, loaded: true, mock: false, latencyMs };
-      log('SYS', `  ${ch.id.toUpperCase()}: ${nativeBal.toFixed(4)} ${ch.native.toUpperCase()} + ${usdcBal.toFixed(2)} USDC [${latencyMs}ms]`);
-    } catch(e) {
-      log('WARN', `  ${ch.id.toUpperCase()} balance error: ${e.message}`);
-      S.wallet.balances[ch.id] = { ...MOCK_BALANCES[ch.id], loaded: true, mock: true, error: true };
-    }
+    const nativeBal = parseInt(nativeHex, 16) / 1e18;
+    const usdcBal   = parseInt(usdcHex, 16) / 1e6;
+
+    S.wsLatency[ch.id] = lat;
+    S.wallet.balances[ch.id] = {
+      [ch.native]: nativeBal, usdc: usdcBal,
+      loaded: true, mock: false, latencyMs: lat, ts: Date.now()
+    };
+    return ch.id + ': ' + nativeBal.toFixed(4) + ' ' + ch.native.toUpperCase() + ' + $' + usdcBal.toFixed(2) + ' [' + lat + 'ms]';
   }));
 
-  // Solana via Helius/public
+  evmResults.forEach(function(r, i) {
+    if (r.status === 'fulfilled') log('SYS','  ✓ '+r.value);
+    else {
+      const ch = EVM_CHAINS[i];
+      log('WARN','  ✗ '+ch.id+': '+r.reason?.message);
+      // Fallback la mock
+      S.wallet.balances[ch.id] = Object.assign({}, MOCK_BALANCES[ch.id], {loaded:true, mock:true, error:true});
+    }
+  });
+
+  // Solana
   try {
+    const t0Sol = Date.now();
     const solRpc = S.cfg.heliusKey
-      ? `https://mainnet.helius-rpc.com/?api-key=${S.cfg.heliusKey}`
+      ? 'https://mainnet.helius-rpc.com/?api-key='+S.cfg.heliusKey
       : 'https://api.mainnet-beta.solana.com';
+    const solAddr = S.wallet.solAddress || address; // folosim adresa Phantom dacă există
     const r = await fetch(solRpc, {
-      method: 'POST',
-      headers: { 'Content-Type': 'application/json' },
-      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getBalance', params:[address] }),
-      signal: AbortSignal.timeout(5000),
+      method:'POST', headers:{'Content-Type':'application/json'},
+      body: JSON.stringify({jsonrpc:'2.0',id:1,method:'getBalance',params:[solAddr]}),
+      signal: AbortSignal.timeout(7000)
     });
     const d = await r.json();
     const solBal = (d.result?.value || 0) / 1e9;
-    S.wallet.balances.sol = { sol: solBal, usdc: 0, loaded: true, mock: false };
-    log('SYS', `  SOL: ${solBal.toFixed(4)} SOL`);
+    const latSol = Date.now() - t0Sol;
+    S.wsLatency.sol = latSol;
+    S.wallet.balances.sol = { sol: solBal, usdc: 0, loaded: true, mock: false, latencyMs: latSol };
+    log('SYS','  ✓ SOL: '+solBal.toFixed(4)+' SOL ['+latSol+'ms]');
   } catch(e) {
-    S.wallet.balances.sol = { ...MOCK_BALANCES.sol, loaded: true, mock: true, error: true };
+    log('WARN','  ✗ SOL: '+e.message);
+    S.wallet.balances.sol = Object.assign({}, MOCK_BALANCES.sol, {loaded:true, mock:true, error:true});
   }
 
+  log('SYS','\u{1F4B0} Balanțe live încărcate. Total chains: 6');
+  // Re-render panel dacă e vizibil
   if (activePane === 'settings') renderSettings();
 }
+
 
 // ═══════════════════════════════════════════════════════════════
 // SUNET — notificări sonore oportunități
@@ -3608,10 +3649,16 @@ function disconnectEVM() {
   S.wallet.usdcBalance  = 0;
   S.wallet.chainId      = null;
   // Reset balante la mock dacă mockMode activ
-  if (S.cfg.mockMode) loadMockBalances();
+  liveMode = S.cfg.liveMode || false;
+  if (S.cfg.mockMode) {
+    loadMockBalances();
+  } else if (S.wallet.evmAddress) {
+    loadLiveBalances(S.wallet.evmAddress);
+  }
   else Object.keys(S.wallet.balances).forEach(k => S.wallet.balances[k] = { eth:0, usdc:0, loaded:false });
   log('SYS', '🔌 MetaMask deconectat');
   if (activePane === 'settings') renderSettings();
+  if (activePane === 'wallet') renderWalletTab();
 }
 
 function disconnectPhantom() {
@@ -3627,77 +3674,91 @@ function disconnectPhantom() {
 // RENDER BALANCE PANEL (Settings)
 // ═══════════════════════════════════════════════════════════════
 function renderBalancePanel() {
-  const chains = [
-    { id:'arb',  label:'Arbitrum',  color:'#28A0F0', native:'ETH',   nKey:'eth'  },
-    { id:'base', label:'Base',      color:'#0052FF', native:'ETH',   nKey:'eth'  },
-    { id:'op',   label:'Optimism',  color:'#FF0420', native:'ETH',   nKey:'eth'  },
-    { id:'poly', label:'Polygon',   color:'#8247E5', native:'MATIC', nKey:'matic'},
-    { id:'bsc',  label:'BSC',       color:'#F0B90B', native:'BNB',   nKey:'bnb'  },
-    { id:'sol',  label:'Solana',    color:'#9945FF', native:'SOL',   nKey:'sol'  },
+  const CHAIN_CFG = [
+    { id:'arb',  label:'Arbitrum',  color:'#28A0F0', native:'ETH',   nKey:'eth',
+      px: function(){ return realEth||2080; } },
+    { id:'base', label:'Base',      color:'#0052FF', native:'ETH',   nKey:'eth',
+      px: function(){ return realEth||2080; } },
+    { id:'op',   label:'Optimism',  color:'#FF0420', native:'ETH',   nKey:'eth',
+      px: function(){ return realEth||2080; } },
+    { id:'poly', label:'Polygon',   color:'#8247E5', native:'MATIC', nKey:'matic',
+      px: function(){ return realMatic||0.55; } },
+    { id:'bsc',  label:'BSC',       color:'#F0B90B', native:'BNB',   nKey:'bnb',
+      px: function(){ return realBnb||600; } },
+    { id:'sol',  label:'Solana',    color:'#9945FF', native:'SOL',   nKey:'sol',
+      px: function(){ return realSol||87; } },
   ];
-  const isMock = S.cfg.mockMode;
-  const rows = chains.map(ch => {
-    const b = S.wallet.balances[ch.id];
-    const loaded = b?.loaded;
-    const mock = b?.mock;
-    const lat = S.wsLatency[ch.id];
-    const lastP = S.wsLastPrice[ch.id];
-    const ageS = lastP ? ((Date.now()-lastP)/1000).toFixed(0) : '—';
-    const nativePx = ch.id==='sol' ? (realSol||85) : ch.id==='bsc'&&ch.nKey==='bnb' ? 600 : (realEth||2020);
-    const nativeVal = loaded ? (b[ch.nKey]||0)*nativePx : 0;
-    const usdcVal   = loaded ? (b.usdc||0) : 0;
-    const totalUSD  = nativeVal + usdcVal;
-    return `
-      <div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr 70px;align-items:center;gap:4px;
-                  padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.04);font-size:10px">
-        <div>
-          <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${ch.color};margin-right:4px"></span>
-          <span style="color:var(--fg)">${ch.label}</span>
-          ${mock ? '<span style="color:var(--yellow);font-size:8px"> MOCK</span>' : ''}
-        </div>
-        <div style="color:var(--cyan);text-align:right">${loaded?(b[ch.nKey]||0).toFixed(4):'-'} ${ch.native}</div>
-        <div style="color:var(--green);text-align:right">${loaded?'$'+(b.usdc||0).toFixed(2):'-'} USDC</div>
-        <div style="color:var(--fg);text-align:right;font-weight:bold">${loaded?'$'+totalUSD.toFixed(2):'-'}</div>
-        <div style="text-align:right">
-          <span style="color:${getLatencyColor(lat)};font-size:9px">${lat!=null?lat+'ms':'—'}</span><br>
-          <span style="color:var(--dim);font-size:8px">${ageS}s</span>
-        </div>
-      </div>`;
-  }).join('');
 
-  const totalAll = chains.reduce((sum, ch) => {
+  const isMock   = S.cfg.mockMode;
+  const hasWallet = S.wallet.evmConnected || S.wallet.solConnected;
+  const anyLoaded = Object.values(S.wallet.balances).some(b=>b.loaded);
+
+  // Placeholder dacă nu avem date
+  if (!isMock && !anyLoaded) {
+    return '<div style="background:rgba(0,255,150,.04);border:1px solid rgba(0,255,150,.15);border-radius:6px;padding:14px;margin-bottom:10px;text-align:center">'
+      + '<div style="font-size:9px;color:#00ff96;letter-spacing:1px;margin-bottom:8px">\u{1F4B0} BALAN\u021AE</div>'
+      + '<div style="font-size:10px;color:var(--dim);margin-bottom:10px">Conecteaz\u0103 MetaMask pentru balan\u021Ae live<br>sau activeaz\u0103 Mod Test pentru valori simulate</div>'
+      + '<div style="display:flex;gap:8px;justify-content:center">'
+      + '<button onclick="connectEVM()" style="padding:5px 12px;background:rgba(100,200,255,.15);border:1px solid #64c8ff;border-radius:4px;color:#64c8ff;cursor:pointer;font-size:10px">MetaMask</button>'
+      + '<button onclick="toggleMockMode(true)" style="padding:5px 12px;background:rgba(255,200,0,.1);border:1px solid #ffcc00;border-radius:4px;color:#ffcc00;cursor:pointer;font-size:10px">\u{1F9EA} Mod Test</button>'
+      + '</div></div>';
+  }
+
+  // Calculăm totalul
+  const totalAll = CHAIN_CFG.reduce(function(sum, ch) {
     const b = S.wallet.balances[ch.id];
-    if (!b?.loaded) return sum;
-    const nativePx = ch.id==='sol'?(realSol||85):ch.id==='bsc'&&ch.nKey==='bnb'?600:(realEth||2020);
-    return sum + (b[ch.nKey]||0)*nativePx + (b.usdc||0);
+    if (!b || !b.loaded) return sum;
+    return sum + (b[ch.nKey]||0)*ch.px() + (b.usdc||0);
   }, 0);
 
-  return `
-    <div style="background:rgba(0,255,150,.04);border:1px solid rgba(0,255,150,.15);border-radius:6px;
-                overflow:hidden;margin-bottom:10px">
-      <!-- header -->
-      <div style="display:flex;align-items:center;justify-content:space-between;
-                  padding:7px 10px;background:rgba(0,255,150,.06);border-bottom:1px solid rgba(0,255,150,.1)">
-        <div style="font-size:9px;color:var(--green);letter-spacing:1px">
-          💰 BALANȚE — ${isMock?'<span style="color:var(--yellow)">🧪 MOD TEST</span>':'LIVE'}
-        </div>
-        <div style="display:flex;gap:6px;align-items:center">
-          <span style="font-size:10px;color:var(--fg)">Total: <b style="color:var(--green)">$${totalAll.toFixed(2)}</b></span>
-          <button onclick="if(S.cfg.mockMode){loadMockBalances();}else if(S.wallet.evmAddress){loadLiveBalances(S.wallet.evmAddress);}"
-            style="padding:2px 7px;background:rgba(0,255,150,.15);border:1px solid var(--green);
-                   border-radius:3px;color:var(--green);cursor:pointer;font-size:9px">↺ Refresh</button>
-        </div>
-      </div>
-      <!-- column headers -->
-      <div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr 70px;gap:4px;
-                  padding:4px 6px;font-size:8px;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.04)">
-        <div>CHAIN</div><div style="text-align:right">NATIVE</div>
-        <div style="text-align:right">USDC</div><div style="text-align:right">TOTAL USD</div>
-        <div style="text-align:right">LATENCY / AGE</div>
-      </div>
-      ${rows}
-    </div>`;
+  const isMockLabel = isMock
+    ? '<span style="color:#ffcc00">\u{1F9EA} MOD TEST</span>'
+    : '<span style="color:#00ff96">LIVE</span>';
+
+  const rows = CHAIN_CFG.map(function(ch) {
+    const b   = S.wallet.balances[ch.id];
+    const loaded = b && b.loaded;
+    const mock   = b && b.mock;
+    const lat    = S.wsLatency[ch.id];
+    const lastP  = S.wsLastPrice[ch.id];
+    const ageS   = lastP ? ((Date.now()-lastP)/1000).toFixed(0) : '\u2014';
+    const nativeVal = loaded ? (b[ch.nKey]||0)*ch.px() : 0;
+    const usdcVal   = loaded ? (b.usdc||0) : 0;
+    const totalUSD  = nativeVal + usdcVal;
+    const latColor  = lat===null||lat===undefined
+      ? 'var(--dim)' : lat<300 ? '#00ff96' : lat<800 ? '#ffcc00' : '#ff4444';
+    const nativeStr = loaded ? (b[ch.nKey]||0).toFixed(4)+' '+ch.native : '\u2014';
+    const usdcStr   = loaded ? '$'+(b.usdc||0).toFixed(2) : '\u2014';
+    const totalStr  = loaded ? '$'+totalUSD.toFixed(2) : '\u2014';
+    const latStr    = lat!=null ? lat+'ms' : '\u2014';
+
+    return '<div style="display:grid;grid-template-columns:90px 1fr 80px 88px 60px;align-items:center;'
+      + 'padding:5px 8px;border-bottom:1px solid rgba(255,255,255,.04);font-size:10px">'
+      + '<div style="display:flex;align-items:center;gap:5px">'
+      + '<span style="width:7px;height:7px;border-radius:50%;background:'+ch.color+';display:inline-block;flex-shrink:0"></span>'
+      + '<span style="color:var(--fg)">'+ch.label+'</span>'
+      + (mock ? '<span style="color:#ffcc00;font-size:8px">M</span>' : '') + '</div>'
+      + '<div style="color:#4fd1ff;text-align:right">'+nativeStr+'</div>'
+      + '<div style="color:#00cc88;text-align:right">'+usdcStr+'</div>'
+      + '<div style="color:var(--fg);text-align:right;font-weight:bold">'+totalStr+'</div>'
+      + '<div style="text-align:right"><span style="color:'+latColor+';font-size:9px">'+latStr+'</span></div>'
+      + '</div>';
+  }).join('');
+
+  return '<div id="balancePanelDiv" style="background:rgba(0,255,150,.04);border:1px solid rgba(0,255,150,.2);border-radius:6px;overflow:hidden;margin-bottom:10px">'
+    + '<div style="display:flex;align-items:center;justify-content:space-between;padding:7px 10px;background:rgba(0,255,150,.07)">'
+    + '<div style="font-size:9px;color:#00ff96;letter-spacing:1px;font-weight:bold">\u{1F4B0} BALAN\u021AE \u2014 '+isMockLabel+'</div>'
+    + '<div style="display:flex;gap:6px;align-items:center">'
+    + '<span style="font-size:11px;color:var(--fg)">Total: <b style="color:#00ff96">$'+totalAll.toFixed(2)+'</b></span>'
+        + '<button onclick="refreshBalancePanel()" style="padding:2px 7px;background:rgba(0,255,150,.15);border:1px solid #00ff96;border-radius:3px;color:#00ff96;cursor:pointer;font-size:9px">\u21BA</button>'
+    + (isMock ? '<button onclick="toggleMockMode(false)" style="padding:2px 7px;background:rgba(0,150,255,.1);border:1px solid #4488ff;border-radius:3px;color:#4488ff;cursor:pointer;font-size:9px">\u{1F4E1} Live</button>' : '')
+    + '</div></div>'
+    + '<div style="display:grid;grid-template-columns:90px 1fr 80px 88px 60px;padding:3px 8px;font-size:8px;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.05)">'
+    + '<div>CHAIN</div><div style="text-align:right">NATIVE</div><div style="text-align:right">USDC</div><div style="text-align:right">TOTAL</div><div style="text-align:right">RPC</div></div>'
+    + rows + '</div>';
 }
+
+
 
 // ═══════════════════════════════════════════════════════════════
 // RENDER WSS STATUS PANEL (tab nou sau inline)
@@ -3793,6 +3854,29 @@ function getHeliusUrl(type) {
     : 'https://mainnet.helius-rpc.com/?api-key='+key;
 }
 
+
+function promptLiveAddress() {
+  const addr = prompt('Introdu adresa EVM (0x...) pentru balanțe live:\n(sau conectează MetaMask pentru adresa ta)', S.wallet.evmAddress || '');
+  if (!addr || !addr.startsWith('0x') || addr.length !== 42) {
+    if (addr) alert('Adresă invalidă — trebuie să înceapă cu 0x și să aibă 42 caractere');
+    return;
+  }
+  S.cfg.mockMode = false;
+  loadLiveBalances(addr);
+}
+
+
+function refreshBalancePanel() {
+  if (S.cfg.mockMode) {
+    loadMockBalances();
+  } else if (S.wallet.evmAddress) {
+    loadLiveBalances(S.wallet.evmAddress);
+  } else {
+    log('WARN', 'Conectează MetaMask pentru balanțe live');
+  }
+  if (activePane === 'settings') renderSettings();
+}
+
 function toggleMockMode(enabled) {
   S.cfg.mockMode = enabled;
   if (enabled) {
@@ -3825,10 +3909,121 @@ function renderDbgDetect() {
   ].join('<br>');
 }
 
+
+function renderWalletTab() {
+  const el = document.getElementById('pane_wallet');
+  if (!el) return;
+  const addr = S.wallet.evmAddress;
+  const solAddr = S.wallet.solAddress;
+
+  el.innerHTML = `
+    <div style="padding:12px;max-width:700px;margin:0 auto">
+
+      <!-- CONNECT BUTTONS ──────────────────────────────────── -->
+      <div style="display:flex;gap:8px;margin-bottom:14px">
+        <button onclick="${addr ? 'disconnectEVM()' : 'connectEVM()'}"
+          style="flex:1;padding:10px;background:${addr ? 'rgba(255,50,50,.12)' : 'rgba(0,200,100,.12)'};
+                 border:1px solid ${addr ? 'var(--red)' : 'var(--green)'};border-radius:6px;
+                 color:${addr ? 'var(--red)' : 'var(--green)'};cursor:pointer;font-size:12px;font-weight:bold">
+          ${addr ? '⏏ Deconectează MetaMask' : '🦊 Conectează MetaMask (EVM)'}
+        </button>
+        <button onclick="${solAddr ? 'disconnectPhantom()' : 'connectPhantom()'}"
+          style="flex:1;padding:10px;background:${solAddr ? 'rgba(255,50,50,.12)' : 'rgba(153,69,255,.12)'};
+                 border:1px solid ${solAddr ? 'var(--red)' : 'var(--sol)'};border-radius:6px;
+                 color:${solAddr ? 'var(--red)' : 'var(--sol)'};cursor:pointer;font-size:12px;font-weight:bold">
+          ${solAddr ? '⏏ Deconectează Phantom' : '👻 Conectează Phantom (SOL)'}
+        </button>
+      </div>
+
+      <!-- WALLET INFO ─────────────────────────────────────── -->
+      ${addr ? '<div style="background:rgba(0,255,150,.05);border:1px solid rgba(0,255,150,.2);border-radius:6px;padding:10px;margin-bottom:14px;font-size:11px">'
+        + '<div style="color:var(--dim);font-size:9px;margin-bottom:4px">EVM ADDRESS</div>'
+        + '<div style="color:var(--green);font-family:monospace">' + addr + '</div>'
+        + '<div style="color:var(--dim);font-size:9px;margin-top:6px">Chain ID: ' + (S.wallet.chainId||'?') + '</div>'
+        + '</div>' : ''}
+
+      <!-- BALANCE TABLE ───────────────────────────────────── -->
+      ${renderBalancePanel()}
+
+      <!-- WSS STATUS ─────────────────────────────────────── -->
+      ${renderWssStatusPanel()}
+
+      <!-- LOAD LIVE BUTTON ────────────────────────────────── -->
+      ${addr ? '<button onclick="loadLiveBalances(S.wallet.evmAddress).then(()=>renderWalletTab())" style="width:100%;padding:10px;background:rgba(0,150,255,.12);border:1px solid #4488ff;border-radius:6px;color:#4488ff;cursor:pointer;font-size:12px;margin-top:6px">📡 Încarcă Balanțe Live de pe Blockchain</button>' : ''}
+
+      <!-- MOCK TOGGLE ─────────────────────────────────────── -->
+      <div style="display:flex;align-items:center;justify-content:space-between;margin-top:10px;padding:8px 10px;background:rgba(255,200,0,.04);border:1px solid rgba(255,200,0,.15);border-radius:6px">
+        <div>
+          <span style="color:var(--yellow);font-size:10px;font-weight:bold">🧪 Mod Test (Mock Balances)</span>
+          <span style="color:var(--dim);font-size:9px;margin-left:8px">Balanțe simulate — fără wallet necesar</span>
+        </div>
+        <label style="cursor:pointer;display:flex;align-items:center;gap:6px">
+          <input type="checkbox" ${S.cfg.mockMode?'checked':''} onchange="toggleMockMode(this.checked);renderWalletTab()"
+            style="width:14px;height:14px;cursor:pointer">
+          <span style="font-size:10px;color:${S.cfg.mockMode?'var(--yellow)':'var(--dim)'}">${S.cfg.mockMode?'ON':'OFF'}</span>
+        </label>
+      </div>
+    </div>`;
+}
+
+
+function renderBalancesPane() {
+  const el = document.getElementById('balancesPaneContent');
+  if (!el) return;
+
+  // Header cu butoane de acțiune
+  const isMock = S.cfg.mockMode;
+  const addr = S.wallet.evmAddress;
+
+  el.innerHTML = '<div style="max-width:800px;margin:0 auto">'
+
+    // ── Header ──────────────────────────────────────────────
+    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
+    + '<div style="font-size:13px;font-weight:bold;color:var(--fg)">💰 Balanțe per Chain</div>'
+    + '<div style="display:flex;gap:6px">'
+    + '<button onclick="toggleMockMode(true);renderBalancesPane()" style="padding:4px 10px;background:'+(isMock?'rgba(255,200,0,.25)':'rgba(255,255,255,.05)')+';border:1px solid '+(isMock?'#ffcc00':'var(--brd)')+';border-radius:4px;color:'+(isMock?'#ffcc00':'var(--dim)')+';cursor:pointer;font-size:10px">🧪 Mock</button>'
+    + '<button onclick="toggleMockMode(false);if(S.wallet.evmAddress)loadLiveBalances(S.wallet.evmAddress);renderBalancesPane()" style="padding:4px 10px;background:'+(!isMock?'rgba(0,150,255,.2)':'rgba(255,255,255,.05)')+';border:1px solid '+(!isMock?'#4488ff':'var(--brd)')+';border-radius:4px;color:'+(!isMock?'#4488ff':'var(--dim)')+';cursor:pointer;font-size:10px">📡 Live</button>'
+    + '<button onclick="'+(isMock?'loadMockBalances()':'(S.wallet.evmAddress&&loadLiveBalances(S.wallet.evmAddress))')+';setTimeout(renderBalancesPane,500)" style="padding:4px 10px;background:rgba(0,255,150,.1);border:1px solid #00ff96;border-radius:4px;color:#00ff96;cursor:pointer;font-size:10px">↺ Refresh</button>'
+    + '</div></div>'
+
+    // ── Status wallet ────────────────────────────────────────
+    + '<div style="background:rgba(255,255,255,.03);border:1px solid var(--brd);border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:10px;display:flex;justify-content:space-between;align-items:center">'
+    + '<div>'
+    + (addr
+        ? '<span style="color:#00ff96">✓ MetaMask: '+addr.slice(0,8)+'...'+addr.slice(-4)+'</span>'
+        : '<span style="color:var(--dim)">○ Wallet neconectat — afișez '+(isMock?'balanțe simulate':'date demo')+'</span>')
+    + '</div>'
+    + '<div style="color:var(--dim);font-size:9px">'+( isMock ? '🧪 MOD TEST' : '📡 LIVE VIA ALCHEMY')+'</div>'
+    + '</div>'
+
+    // ── Tabel balanțe ────────────────────────────────────────
+    + renderBalancePanel()
+
+    // ── WSS Status ───────────────────────────────────────────
+    + renderWssStatusPanel()
+
+    // ── Dacă nu e conectat, arătăm instrucțiuni ─────────────
+    + (!addr && !isMock ? renderMetaMaskFileBanner() : '')
+
+    + '</div>';
+}
+
 function renderSettings() {
   const slipColor = S.cfg.slippage<0.3?'var(--green)':S.cfg.slippage<0.8?'var(--yellow)':'var(--red)';
   const slipWarn  = S.cfg.slippage>0.8?'⚠ Slippage ridicat — opp-urile vor fi rare':'';
   $('settingsContent').innerHTML=`
+
+    <!-- BALANCE PANEL ───────────────────────────────────────── -->
+    ${renderBalancePanel()}
+
+    <!-- WSS STATUS ──────────────────────────────────────────── -->
+    ${renderWssStatusPanel()}
+
+    <!-- BALANCE PANEL ───────────────────────────────────────── -->
+    \${renderBalancePanel()}
+
+    <!-- WSS STATUS ──────────────────────────────────────────── -->
+    \${renderWssStatusPanel()}
 
     <!-- ── ALCHEMY API KEY ─────────────────────────────────────────── -->
     <div style="background:rgba(100,200,255,.06);border:1px solid rgba(100,200,255,.25);border-radius:6px;padding:10px;margin-bottom:10px">
@@ -3912,6 +4107,12 @@ function renderSettings() {
         + ' &nbsp; <span style="color:var(--cyan)">USDC: $' + (S.wallet.usdcBalance||0).toFixed(2) + '</span>'
         + '</div>' : ''}
     </div>
+
+    <!-- BALANCE PANEL ───────────────────────────────────────── -->
+    \${renderBalancePanel()}
+
+    <!-- WSS STATUS ──────────────────────────────────────────── -->
+    \${renderWssStatusPanel()}
 
     <div class="setlbl">Detecție & Filtrare</div>
     <div style="background:rgba(0,150,200,.04);border:1px solid var(--brd);border-radius:4px;padding:7px;margin-bottom:8px;font-size:10px;color:var(--dim)">
@@ -4124,9 +4325,18 @@ async function connectEVM() {
     S.wallet.evmConnected = true;
     S.wallet.evmAddress   = addr;
     S.wallet.chainId      = chainId;
+    // Încarcă automat balanțele live după conectare
+    loadLiveBalances(addr).catch(()=>{});
 
     log('LIVE',`✓ MetaMask conectat: ${addr.slice(0,8)}... | Chain: ${chainId} | ${supported?'Chain suportat':'⚠ Chain nesuportat — switch la Arbitrum'}`);
     if (!supported) log('WARN', 'Schimbă chain-ul la Arbitrum (0xa4b1) pentru execuție optimă');
+    // Dezactivăm mock mode și încărcăm balanțe reale
+    S.cfg.mockMode = false;
+    loadLiveBalances(addr).catch(e => {
+      log('WARN', 'Balance fetch: ' + e.message + ' — reactivez mock');
+      S.cfg.mockMode = true;
+      loadMockBalances();
+    });
 
     // Balance check — ETH + USDC pe chain-ul curent
     if (typeof ethers !== 'undefined') {
@@ -4167,6 +4377,9 @@ async function connectEVM() {
     });
 
     if (activePane==='settings') renderSettings();
+    if (activePane==='wallet') renderWalletTab();
+    // Dacă mockMode=off, încarcă balanțe live automat
+    if (!S.cfg.mockMode) loadLiveBalances(addr).then(()=>{ if(activePane==='wallet')renderWalletTab(); });
   } catch(e) {
     log('ERR','MetaMask: '+e.message);
   }
@@ -4205,6 +4418,7 @@ function toggleLiveMode() {
     );
     if (!confirmed) return;
     S.cfg.liveMode = true;
+    liveMode = true; // sync variabila globală
     $('lMode').textContent = 'LIVE';
     $('lMode').style.color = 'var(--red)';
     $('lMode').style.fontWeight = 'bold';
@@ -4213,6 +4427,7 @@ function toggleLiveMode() {
     connectMetaMask().catch(e => {
       log('ERR', 'MetaMask: ' + e.message);
       S.cfg.liveMode = false;
+      liveMode = false;
       $('lMode').textContent = 'SIM';
       $('lMode').style.color = 'var(--yellow)';
       $('lMode').style.fontWeight = 'normal';
@@ -4223,6 +4438,7 @@ function toggleLiveMode() {
     $('bannerMode').style.color = 'var(--red)';
   } else {
     S.cfg.liveMode = false;
+    liveMode = false; // sync variabila globală
     $('lMode').textContent = 'SIM';
     $('lMode').style.color = 'var(--yellow)';
     $('lMode').style.fontWeight = 'normal';
@@ -4278,18 +4494,20 @@ function doRebalance() {
 // ══════════════════════════════════════════════════════════════
 function goTab(name) {
   activePane=name;
-  ['opps','pnl','prices','history','bridges','feeds','liveready','settings'].forEach(t=>{
+  ['opps','wallet','pnl','prices','history','bridges','feeds','liveready','settings','balances'].forEach(t=>{
     const p=$('pane_'+t),tb=$('tab_'+t);
     if (!p||!tb) return;
     const on=t===name;
     p.style.display=on?'':'none';
     tb.className='tab'+(on?' on':'');
   });
+  if (name==='wallet')    renderWalletTab();
   if (name==='history')   renderHistory();
   if (name==='bridges')   renderBridges();
   if (name==='feeds')     renderFeeds();
   if (name==='liveready') renderLive();
   if (name==='settings')  renderSettings();
+  if (name==='balances')  renderBalancesPane();
   if (name==='prices')    renderPrices();
   if (name==='pnl')       { renderPnlTab(); setTimeout(drawPnlChart,50); }
 }
@@ -4468,4 +4686,6 @@ function downloadSelf() {
 
 </script>
 </body>
-</html>
+</html
+  setInterval(() => { if (activePane === 'balances') renderBalancesPane(); }, 5000);
+>
