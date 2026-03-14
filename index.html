@@ -504,12 +504,29 @@ const S = {
   // Wallet state
   wallet: {
     evmConnected: false,
-    evmAddress: null,
-    evmBalance: null,
+    evmAddress:   null,
+    evmBalance:   0,
+    usdcBalance:  0,
     solConnected: false,
-    solAddress: null,
-    chainId: null,
+    solAddress:   null,
+    chainId:      null,
+    // Balante per chain (live sau mock)
+    balances: {
+      arb:  { eth: 0, usdc: 0, loaded: false },
+      base: { eth: 0, usdc: 0, loaded: false },
+      op:   { eth: 0, usdc: 0, loaded: false },
+      poly: { eth: 0, usdc: 0, loaded: false },
+      bsc:  { bnb: 0, usdc: 0, loaded: false },
+      sol:  { sol: 0, usdc: 0, loaded: false },
+    },
   },
+  // Latenta WSS per chain
+  wsLatency: { arb: null, base: null, op: null, poly: null, bsc: null, sol: null },
+  wsLastPrice: { arb: null, base: null, op: null, poly: null, bsc: null, sol: null },
+  // Ultimul trade confirmat manual
+  lastTradeTs: 0,
+  // Notificare sonora activa
+  _audioCtx: null,
   // Live price source tracking
   priceSource: 'none', // 'cg' | 'chainlink' | 'pyth' | 'fallback'
   lastPriceFetch: 0,
@@ -528,6 +545,14 @@ const S = {
     circuitBreaker: false, // auto-set when price source fails
     // ── Alchemy API Keys ────────────────────────────────────────
     alchemyKey: 'xP6sNWNG29sPnx7XogQqV',  // Alchemy API key — WSS + RPC
+    oneInchKey: '',
+    heliusKey:  '',
+    mockMode:   true,   // TEST MODE — balante mock, fără wallet necesar
+    maxTradeUSD: 1000,  // safeguard: max capital per trade
+    stopLoss:    -50,   // stop-loss în USD (auto-stop când P&L < valoare)
+    cooldownSec: 30,    // secunde cooldown între trades live
+    manualConfirm: true, // confirmare manuală înainte de fiecare trade LIVE
+    soundAlerts: true,  // notificări sonore pentru oportunități
   },
 };
 
@@ -675,15 +700,6 @@ const _bridgeQuoteCache = {};
 let BRIDGE_QUOTE_TTL  = 60000; // ms — refresh la fiecare 60s (evităm 429 rate limit)
 
 // Chain IDs pentru Relay.link API
-// MEV Protection RPCs — tranzacții private, bypass mempool public
-const MEV_RPCS = {
-  arb:  'https://rpc.flashbots.net/fast?hint=calldata&hint=logs&hint=default_logs', // Flashbots Protect
-  base: 'https://rpc.mevblocker.io',   // MEV Blocker
-  op:   'https://rpc.mevblocker.io',   // MEV Blocker
-  poly: 'https://rpc.mevblocker.io',   // MEV Blocker (Polygon suport adăugat)
-  bsc:  'https://bsc-dataseed.binance.org', // BSC — fără MEV prot nativ
-};
-
 const CHAIN_IDS = { arb:42161, base:8453, op:10, poly:137, sol:'solana' };
 // USDC addresses per chain (pentru Relay.link quote)
 const USDC_ADDR = {
@@ -1108,17 +1124,6 @@ const SWAP_TOPIC = '0xc42079f94a6350d7e6235f29174924f928cc2ac818eb64fed8004e115f
 
 // Providers WSS per chain
 // Alchemy dacă e key disponibil (suportă file://), altfel Ankr public
-function getHeliusUrl(type) {
-  // type: 'http' sau 'wss'
-  const key = S.cfg.heliusKey || '';
-  if (!key) return type === 'wss'
-    ? 'wss://api.mainnet-beta.solana.com'
-    : 'https://api.mainnet-beta.solana.com';
-  return type === 'wss'
-    ? `wss://mainnet.helius-rpc.com/?api-key=${key}`
-    : `https://mainnet.helius-rpc.com/?api-key=${key}`;
-}
-
 function getWssUrl(chainId) {
   const key = S.cfg.alchemyKey;
   const ALCHEMY_WSS = {
@@ -1248,6 +1253,7 @@ function connectWssChain(chainId, poolAddr) {
         PX[chainId]['ETH/USDT'] = price;
         markPriceUpdated(chainId, 'ETH/USDC', 'wss');
         markPriceUpdated(chainId, 'ETH/USDT', 'wss');
+        markWssPing(chainId);
 
         // Trigger detect() doar dacă prețul s-a schimbat semnificativ (>0.005%)
         if (!oldPrice || Math.abs(price - oldPrice) / oldPrice > 0.00005) {
@@ -2325,6 +2331,12 @@ function detect() {
   const newOnes=found.filter(o=>!prevIds.has(o.id));
   if (newOnes.length) {
     S.oppCount+=newOnes.length;
+    // Notificare sonora
+    if (newOnes.some(o=>o.netProfit>1)) playAlert('profit');
+    else if (newOnes.length>0) playAlert('opportunity');
+    // Visual flash pe header
+    const hdr = document.getElementById('mainHeader');
+    if (hdr) { hdr.style.boxShadow='0 0 12px rgba(0,255,150,.6)'; setTimeout(()=>{ hdr.style.boxShadow=''; },600); }
     if (newOnes.length<=2) newOnes.forEach(o=>
       log('TRADE',`🎯 ${o.pair} ${o.src.short}→${o.dst.short} gross:${o.grossPct.toFixed(3)}% slip:${o.slipPct.toFixed(3)}%/leg net:+$${o.netProfit.toFixed(3)}`)
     );
@@ -2631,49 +2643,22 @@ async function switchChain(chainId) {
 }
 
 async function get1inchQuote(chainId, fromToken, toToken, amount, walletAddress, slippagePct) {
-  // 1inch API v6 — necesită API key din portal.1inch.dev (gratuit)
-  const apiKey = S.cfg.oneInchKey || '';
-  const slippagePct_num = parseFloat(slippagePct) || 0.5;
-
-  const headers = { 'Accept': 'application/json' };
-  if (apiKey) headers['Authorization'] = 'Bearer ' + apiKey;
-
-  // Încercăm /swap (returnează tx calldata) — necesită API key
-  // Fallback la /quote (returnează doar prețul) — public
-  const isSwap = !!apiKey;
-  const endpoint = isSwap ? 'swap' : 'quote';
-  const url = `https://api.1inch.dev/swap/v6.0/${chainId}/${endpoint}` +
+  // 1inch Fusion API — fără API key pentru quote, cu key pentru execuție
+  // Folosim v6 quote (publică)
+  const slippageBps = Math.round(slippagePct * 100); // % → bps (0.3% → 30)
+  const url = `https://api.1inch.dev/swap/v6.0/${chainId}/swap` +
     `?src=${fromToken}&dst=${toToken}&amount=${amount}` +
-    `&from=${walletAddress}&slippage=${slippagePct_num}&disableEstimate=true&allowPartialFill=false`;
-
+    `&from=${walletAddress}&slippage=${slippageBps}&disableEstimate=false`;
+  
   const r = await fetch(url, {
-    headers,
-    signal: AbortSignal.timeout(8000),
+    headers: { 'Accept': 'application/json' },
+    signal: AbortSignal.timeout(5000),
   });
-
   if (!r.ok) {
     const err = await r.json().catch(() => ({}));
-    // 401 = lipsă API key, 429 = rate limit
-    if (r.status === 401) throw new Error('1inch API key lipsă/invalid — adaugă cheia în Settings → Config → 1inch Key');
-    if (r.status === 429) throw new Error('1inch rate limit — încearcă din nou în 10s');
     throw new Error(`1inch API ${r.status}: ${err.description || err.error || 'unknown'}`);
   }
-
-  const data = await r.json();
-
-  // Normalizăm răspunsul: /swap returnează { tx, toAmount }, /quote returnează { toAmount }
-  return {
-    toAmount: data.toAmount || data.dstAmount || '0',
-    tx: data.tx || {
-      // Fără API key: construim tx manual cu datele disponibile
-      to: fromToken,  // va fi overridden la execuție
-      data: '0x',
-      value: '0',
-      gas: '300000',
-    },
-    isQuoteOnly: !isSwap,
-    priceImpact: data.estimatedGas,
-  };
+  return r.json();
 }
 
 async function execTradeLive(opp) {
@@ -2733,27 +2718,19 @@ async function execTradeLive(opp) {
     opp.slipPct,
   );
 
-  // Dacă nu avem API key, nu putem executa swap
-  if (quote.isQuoteOnly) {
-    throw new Error('1inch API key lipsă — adaugă cheia în Settings → CONFIG → 1inch Key (portal.1inch.dev)');
-  }
-
-  const wethOut = ethers.formatEther(BigInt(quote.toAmount || '0'));
+  const wethOut = ethers.formatEther(quote.toAmount);
   log('SYS', `[3/5] Quote: ${opp.cap} USDC → ${parseFloat(wethOut).toFixed(6)} WETH`);
 
-  // ── STEP 5: Executăm swap via MEV-protected RPC ───────────────
-  log('SYS', `[4/5] Trimitere swap TX cu MEV protection...`);
+  // ── STEP 5: Executăm swap via MetaMask ─────────────────────────
+  log('SYS', `[4/5] Trimitere swap TX — confirmare MetaMask necesară...`);
 
-  // Folosim MEV-protected RPC dacă e disponibil pentru chain-ul sursă
-  const mevRpc = MEV_RPCS[opp.src.id];
-  let swapTx, receipt;
-
+  // Gas live pentru tx
   const feeData = await provider.getFeeData();
   const txParams = {
     to:       quote.tx.to,
     data:     quote.tx.data,
     value:    BigInt(quote.tx.value || 0),
-    gasLimit: BigInt(Math.ceil(parseInt(quote.tx.gas || 300000) * 1.2)),
+    gasLimit: BigInt(Math.ceil(parseInt(quote.tx.gas || 300000) * 1.2)), // +20% buffer
     ...(feeData.maxFeePerGas ? {
       maxFeePerGas:         feeData.maxFeePerGas,
       maxPriorityFeePerGas: feeData.maxPriorityFeePerGas,
@@ -2762,38 +2739,12 @@ async function execTradeLive(opp) {
     }),
   };
 
-  if (mevRpc && S.cfg.mev) {
-    // Trimitem prin MEV-protected RPC (Flashbots/MEVBlocker)
-    log('SYS', `[4/5] 🛡️ MEV Protection: ${mevRpc.split('/')[2]}`);
-    try {
-      // Semnăm local cu MetaMask, trimitem prin MEV RPC
-      const signedTx = await signer.signTransaction({
-        ...txParams,
-        chainId: srcChainId,
-        nonce: await provider.getTransactionCount(_connectedAddress),
-      });
-      const mevProvider = new ethers.JsonRpcProvider(mevRpc);
-      const txResp = await mevProvider.broadcastTransaction(signedTx);
-      swapTx = txResp;
-      log('TRADE', `[4/5] 🚀 TX trimis prin MEV RPC: ${swapTx.hash}`);
-      // Așteptăm confirmarea pe provider-ul normal (MEV RPC nu suportă wait)
-      receipt = await provider.waitForTransaction(swapTx.hash, 1, 60000);
-    } catch(mevErr) {
-      // Fallback la MetaMask normal dacă MEV RPC eșuează
-      log('WARN', `MEV RPC error: ${mevErr.message} — fallback la MetaMask standard`);
-      swapTx = await signer.sendTransaction(txParams);
-      log('TRADE', `[4/5] 🚀 Swap TX (standard): ${swapTx.hash}`);
-      receipt = await swapTx.wait(1);
-    }
-  } else {
-    // Trimitere standard prin MetaMask
-    log('SYS', `[4/5] Trimitere standard — confirmare MetaMask necesară...`);
-    swapTx = await signer.sendTransaction(txParams);
-    log('TRADE', `[4/5] 🚀 Swap TX trimis: ${swapTx.hash}`);
-    receipt = await swapTx.wait(1);
-  }
+  const swapTx = await signer.sendTransaction(txParams);
+  log('TRADE', `[4/5] 🚀 Swap TX trimis: ${swapTx.hash}`);
+  log('SYS', `Aștept confirmare on-chain...`);
 
-  if (!receipt || receipt.status !== 1) throw new Error('Swap TX revertit on-chain');
+  const receipt = await swapTx.wait(1);
+  if (receipt.status !== 1) throw new Error('Swap TX revertit on-chain');
   log('TRADE', `[4/5] ✅ Swap confirmat în block #${receipt.blockNumber}`);
 
   // ── STEP 6: Inițiere bridge ────────────────────────────────────
@@ -2814,6 +2765,14 @@ async function execTradeLive(opp) {
 }
 
 async function execTrade(opp) {
+  // SAFEGUARDS
+  if (liveMode && !checkSafeguards(opp)) { S._execLock=false; return; }
+  // CONFIRMARE MANUALA
+  if (liveMode && S.cfg.manualConfirm) {
+    const confirmed = await confirmTradeDialog(opp);
+    if (!confirmed) { log('SYS','Trade anulat de utilizator'); S._execLock=false; return; }
+  }
+  S.lastTradeTs = Date.now();
   if (!opp) { S._execLock = false; return; }
   if (!S._execLock) S._execLock = true;
 
@@ -3023,70 +2982,94 @@ function renderPnlTab() {
 }
 
 function drawPnlChart() {
-  const cv=$('pnlChartCanvas');
+  const cv = $('pnlChartCanvas');
   if (!cv) return;
-  const W=cv.offsetWidth||600, H=110;
-  cv.width=W; cv.height=H;
-  const ctx=cv.getContext('2d');
-  ctx.clearRect(0,0,W,H);
-  ctx.fillStyle='#091218';
-  ctx.fillRect(0,0,W,H);
+  const W = cv.offsetWidth || 600, H = 130;
+  cv.width = W; cv.height = H;
+  const ctx = cv.getContext('2d');
+  ctx.clearRect(0, 0, W, H);
+  ctx.fillStyle = '#091218';
+  ctx.fillRect(0, 0, W, H);
 
-  if (S.spark.length<2) {
-    ctx.fillStyle='#3a6070';
-    ctx.font='11px JetBrains Mono';
-    ctx.textAlign='center';
-    ctx.fillText('Execută trade-uri pentru evoluția P&L',W/2,H/2);
+  const data = S.spark;
+  if (data.length < 2) {
+    ctx.fillStyle = '#2a4a5a';
+    ctx.font = '11px monospace';
+    ctx.fillText('P&L chart — pornește botul...', W/2-80, H/2);
     return;
   }
-  const mn=Math.min(...S.spark,0)*1.1, mx=Math.max(...S.spark,.01)*1.1;
-  const rng=mx-mn||.01;
-  const toY=v=>H-2-((v-mn)/rng)*(H-4);
-  const zeroY=toY(0);
 
-  // Grid
-  ctx.strokeStyle='rgba(13,37,53,.8)'; ctx.lineWidth=1;
-  [0,.25,.5,.75,1].forEach(t=>{
-    const y=Math.round(H*t)+.5;
-    ctx.beginPath();ctx.moveTo(0,y);ctx.lineTo(W,y);ctx.stroke();
+  // Grid linii orizontale
+  const mn = Math.min(...data, 0), mx = Math.max(...data, 0.01);
+  const rng = mx - mn || 0.01;
+  ctx.strokeStyle = 'rgba(255,255,255,.05)';
+  ctx.lineWidth = 1;
+  [0, 0.25, 0.5, 0.75, 1].forEach(t => {
+    const y = H - 14 - t * (H - 24);
+    ctx.beginPath(); ctx.moveTo(0, y); ctx.lineTo(W, y); ctx.stroke();
+    const val = mn + t * rng;
+    ctx.fillStyle = 'rgba(255,255,255,.25)';
+    ctx.font = '8px monospace';
+    ctx.fillText((val>=0?'+':'')+val.toFixed(2), 3, y - 2);
   });
 
-  // Zero line
-  if (zeroY>=0&&zeroY<=H) {
-    ctx.beginPath();ctx.moveTo(0,zeroY);ctx.lineTo(W,zeroY);
-    ctx.strokeStyle='rgba(255,255,255,.18)';ctx.lineWidth=1;ctx.stroke();
+  // Linie zero
+  if (mn < 0 && mx > 0) {
+    const zeroY = H - 14 - ((-mn)/rng) * (H-24);
+    ctx.strokeStyle = 'rgba(255,255,255,.2)';
+    ctx.setLineDash([4,4]);
+    ctx.beginPath(); ctx.moveTo(0, zeroY); ctx.lineTo(W, zeroY); ctx.stroke();
+    ctx.setLineDash([]);
   }
 
-  // Area
-  const pts=S.spark.map((v,i)=>[i/(S.spark.length-1)*W,toY(v)]);
+  // Area fill
+  const pts = data.map((v,i) => [i/(data.length-1)*W, H-14-((v-mn)/rng)*(H-24)]);
   ctx.beginPath();
-  ctx.moveTo(pts[0][0],zeroY);
-  pts.forEach(p=>ctx.lineTo(p[0],p[1]));
-  ctx.lineTo(pts[pts.length-1][0],zeroY);
+  ctx.moveTo(pts[0][0], H-14);
+  pts.forEach(p => ctx.lineTo(p[0], p[1]));
+  ctx.lineTo(pts[pts.length-1][0], H-14);
   ctx.closePath();
-  const g=ctx.createLinearGradient(0,0,0,H);
-  const isPos=S.pnl>=0;
-  g.addColorStop(0,isPos?'rgba(0,255,136,.3)':'rgba(255,51,85,.3)');
-  g.addColorStop(1,'rgba(0,0,0,0)');
-  ctx.fillStyle=g;ctx.fill();
+  const grad = ctx.createLinearGradient(0,0,0,H);
+  const lastVal = data[data.length-1];
+  grad.addColorStop(0, lastVal>=0?'rgba(0,255,150,.3)':'rgba(255,60,60,.3)');
+  grad.addColorStop(1, 'rgba(0,0,0,0)');
+  ctx.fillStyle = grad;
+  ctx.fill();
 
-  // Line
+  // Linia principală P&L
   ctx.beginPath();
-  ctx.moveTo(pts[0][0],pts[0][1]);
-  pts.forEach(p=>ctx.lineTo(p[0],p[1]));
-  ctx.strokeStyle=isPos?'#00ff88':'#ff3355';
-  ctx.lineWidth=2;ctx.stroke();
+  ctx.moveTo(pts[0][0], pts[0][1]);
+  pts.forEach(p => ctx.lineTo(p[0], p[1]));
+  ctx.strokeStyle = lastVal>=0?'#00ff96':'#ff4444';
+  ctx.lineWidth = 2;
+  ctx.stroke();
 
-  // Current dot
-  const lp=pts[pts.length-1];
-  ctx.beginPath();ctx.arc(lp[0],lp[1],4,0,Math.PI*2);
-  ctx.fillStyle=isPos?'#00ff88':'#ff3355';ctx.fill();
+  // Spread per chain overlay (ultimele prețuri)
+  const chainColors = { arb:'#28A0F0', base:'#0052FF', op:'#FF0420', poly:'#8247E5', bsc:'#F0B90B' };
+  let xLabel = 4;
+  Object.entries(chainColors).forEach(([id, color]) => {
+    const px = PX[id]?.['ETH/USDC'];
+    if (!px) return;
+    const deviation = realEth ? ((px - realEth)/realEth*100) : 0;
+    ctx.fillStyle = color;
+    ctx.font = 'bold 8px monospace';
+    ctx.fillText(id.toUpperCase()+':'+(deviation>=0?'+':'')+deviation.toFixed(2)+'%', xLabel, H-2);
+    xLabel += 62;
+  });
 
-  // Labels
-  ctx.fillStyle='#3a6070';ctx.font='9px JetBrains Mono';ctx.textAlign='left';
-  ctx.fillText(`$${mx.toFixed(2)}`,3,12);
-  ctx.fillText(`$${mn.toFixed(2)}`,3,H-4);
+  // Punct curent (ultima valoare)
+  const lp = pts[pts.length-1];
+  ctx.beginPath();
+  ctx.arc(lp[0], lp[1], 4, 0, Math.PI*2);
+  ctx.fillStyle = lastVal>=0?'#00ff96':'#ff4444';
+  ctx.fill();
+
+  // Label valoare curentă
+  ctx.fillStyle = lastVal>=0?'#00ff96':'#ff4444';
+  ctx.font = 'bold 10px monospace';
+  ctx.fillText((lastVal>=0?'+':'')+'$'+lastVal.toFixed(3), Math.min(lp[0]+6, W-70), lp[1]+4);
 }
+
 
 
 
@@ -3387,6 +3370,371 @@ async function testAlchemyKey() {
 
 
 
+// ═══════════════════════════════════════════════════════════════
+// MOCK MODE — balante simulate pentru toate chain-urile
+// ═══════════════════════════════════════════════════════════════
+const MOCK_BALANCES = {
+  arb:  { eth: 0.5234, usdc: 1243.50 },
+  base: { eth: 0.2100, usdc:  876.20 },
+  op:   { eth: 0.1800, usdc:  540.00 },
+  poly: { eth: 0.0000, usdc:  320.75, matic: 450.0 },
+  bsc:  { bnb: 1.2500, usdc:  210.30 },
+  sol:  { sol: 3.7800, usdc:  650.00 },
+};
+
+function loadMockBalances() {
+  Object.entries(MOCK_BALANCES).forEach(([chain, bals]) => {
+    S.wallet.balances[chain] = { ...bals, loaded: true, mock: true };
+  });
+  log('SYS', '🧪 MOCK MODE: balanțe simulate încărcate pe toate 6 chain-urile');
+  if (activePane === 'settings') renderSettings();
+}
+
+async function loadLiveBalances(address) {
+  if (!address) return;
+  const alKey = S.cfg.alchemyKey;
+  const chains = [
+    { id: 'arb',  rpc: `https://arb-mainnet.g.alchemy.com/v2/${alKey}`,  native: 'eth',  nativeDec: 18 },
+    { id: 'base', rpc: `https://base-mainnet.g.alchemy.com/v2/${alKey}`, native: 'eth',  nativeDec: 18 },
+    { id: 'op',   rpc: `https://opt-mainnet.g.alchemy.com/v2/${alKey}`,  native: 'eth',  nativeDec: 18 },
+    { id: 'poly', rpc: `https://polygon-mainnet.g.alchemy.com/v2/${alKey}`, native: 'matic', nativeDec: 18 },
+    { id: 'bsc',  rpc: 'https://bsc-dataseed.binance.org',                native: 'bnb',  nativeDec: 18 },
+  ];
+
+  log('SYS', `💰 Încărc balanțe live pe ${chains.length} chain-uri...`);
+
+  await Promise.allSettled(chains.map(async ch => {
+    try {
+      const t0 = Date.now();
+      // Fetch native balance
+      const r = await fetch(ch.rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'eth_getBalance', params:[address,'latest'] }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const data = await r.json();
+      const nativeBal = parseInt(data.result || '0x0', 16) / Math.pow(10, ch.nativeDec);
+      const latencyMs = Date.now() - t0;
+      S.wsLatency[ch.id] = latencyMs;
+
+      // Fetch USDC balance
+      const usdcAddr = USDC_NATIVE[ch.id];
+      const r2 = await fetch(ch.rpc, {
+        method: 'POST',
+        headers: { 'Content-Type': 'application/json' },
+        body: JSON.stringify({
+          jsonrpc:'2.0', id:2,
+          method: 'eth_call',
+          params: [{
+            to: usdcAddr,
+            data: '0x70a08231000000000000000000000000' + address.slice(2).padStart(64, '0'),
+          }, 'latest'],
+        }),
+        signal: AbortSignal.timeout(5000),
+      });
+      const data2 = await r2.json();
+      const usdcBal = parseInt(data2.result || '0x0', 16) / 1e6;
+
+      S.wallet.balances[ch.id] = { [ch.native]: nativeBal, usdc: usdcBal, loaded: true, mock: false, latencyMs };
+      log('SYS', `  ${ch.id.toUpperCase()}: ${nativeBal.toFixed(4)} ${ch.native.toUpperCase()} + ${usdcBal.toFixed(2)} USDC [${latencyMs}ms]`);
+    } catch(e) {
+      log('WARN', `  ${ch.id.toUpperCase()} balance error: ${e.message}`);
+      S.wallet.balances[ch.id] = { ...MOCK_BALANCES[ch.id], loaded: true, mock: true, error: true };
+    }
+  }));
+
+  // Solana via Helius/public
+  try {
+    const solRpc = S.cfg.heliusKey
+      ? `https://mainnet.helius-rpc.com/?api-key=${S.cfg.heliusKey}`
+      : 'https://api.mainnet-beta.solana.com';
+    const r = await fetch(solRpc, {
+      method: 'POST',
+      headers: { 'Content-Type': 'application/json' },
+      body: JSON.stringify({ jsonrpc:'2.0', id:1, method:'getBalance', params:[address] }),
+      signal: AbortSignal.timeout(5000),
+    });
+    const d = await r.json();
+    const solBal = (d.result?.value || 0) / 1e9;
+    S.wallet.balances.sol = { sol: solBal, usdc: 0, loaded: true, mock: false };
+    log('SYS', `  SOL: ${solBal.toFixed(4)} SOL`);
+  } catch(e) {
+    S.wallet.balances.sol = { ...MOCK_BALANCES.sol, loaded: true, mock: true, error: true };
+  }
+
+  if (activePane === 'settings') renderSettings();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SUNET — notificări sonore oportunități
+// ═══════════════════════════════════════════════════════════════
+function initAudio() {
+  if (S._audioCtx) return;
+  try { S._audioCtx = new (window.AudioContext || window.webkitAudioContext)(); } catch(e) {}
+}
+
+function playAlert(type) {
+  if (!S.cfg.soundAlerts) return;
+  initAudio();
+  if (!S._audioCtx) return;
+  const ctx = S._audioCtx;
+  const osc = ctx.createOscillator();
+  const gain = ctx.createGain();
+  osc.connect(gain);
+  gain.connect(ctx.destination);
+
+  if (type === 'opportunity') {
+    // Ding plăcut — oportunitate găsită
+    osc.frequency.setValueAtTime(880, ctx.currentTime);
+    osc.frequency.exponentialRampToValueAtTime(1320, ctx.currentTime + 0.1);
+    gain.gain.setValueAtTime(0.3, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.4);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.4);
+  } else if (type === 'profit') {
+    // Chord pozitiv — trade profitabil
+    [523, 659, 784].forEach((freq, i) => {
+      const o2 = ctx.createOscillator();
+      const g2 = ctx.createGain();
+      o2.connect(g2); g2.connect(ctx.destination);
+      o2.frequency.value = freq;
+      g2.gain.setValueAtTime(0.2, ctx.currentTime + i * 0.05);
+      g2.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.6);
+      o2.start(ctx.currentTime + i * 0.05);
+      o2.stop(ctx.currentTime + 0.6);
+    });
+  } else if (type === 'warning') {
+    // Ton de avertizare
+    osc.frequency.setValueAtTime(220, ctx.currentTime);
+    gain.gain.setValueAtTime(0.25, ctx.currentTime);
+    gain.gain.exponentialRampToValueAtTime(0.001, ctx.currentTime + 0.3);
+    osc.start(ctx.currentTime);
+    osc.stop(ctx.currentTime + 0.3);
+  }
+}
+
+// ═══════════════════════════════════════════════════════════════
+// LATENTA WSS — tracking per chain
+// ═══════════════════════════════════════════════════════════════
+function markWssPing(chainId) {
+  S.wsLatency[chainId] = S.wsLatency[chainId] || null;
+  S.wsLastPrice[chainId] = Date.now();
+}
+
+function getLatencyColor(ms) {
+  if (ms === null) return 'var(--dim)';
+  if (ms < 100) return 'var(--green)';
+  if (ms < 300) return 'var(--yellow)';
+  return 'var(--red)';
+}
+
+// ═══════════════════════════════════════════════════════════════
+// CONFIRMARE MANUALA TRADE LIVE
+// ═══════════════════════════════════════════════════════════════
+function confirmTradeDialog(opp) {
+  return new Promise((resolve) => {
+    const existing = document.getElementById('tradeConfirmModal');
+    if (existing) existing.remove();
+
+    const modal = document.createElement('div');
+    modal.id = 'tradeConfirmModal';
+    modal.style.cssText = 'position:fixed;inset:0;background:rgba(0,0,0,.85);z-index:9999;display:flex;align-items:center;justify-content:center;';
+    modal.innerHTML = `
+      <div style="background:#0d1f2d;border:2px solid var(--red);border-radius:10px;padding:24px;max-width:420px;width:90%;font-size:12px">
+        <div style="color:var(--red);font-size:14px;font-weight:bold;margin-bottom:14px">🔴 CONFIRMARE TRADE LIVE</div>
+        <table style="width:100%;border-collapse:collapse;margin-bottom:14px">
+          <tr><td style="color:var(--dim);padding:3px 0">Pereche</td><td style="color:var(--fg);text-align:right">${opp.pair}</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Ruta</td><td style="color:var(--cyan);text-align:right">${opp.src.short} → ${opp.dst.short}</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Capital</td><td style="color:var(--fg);text-align:right">$${opp.cap}</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Spread brut</td><td style="color:var(--fg);text-align:right">+${opp.grossPct.toFixed(3)}%</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Costuri totale</td><td style="color:var(--red);text-align:right">-$${opp.cost.total.toFixed(3)}</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Profit estimat</td><td style="color:var(--green);text-align:right;font-weight:bold">+$${opp.netProfit.toFixed(3)}</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">Bridge</td><td style="color:var(--fg);text-align:right">${opp.br.name} (~${opp.br.time})</td></tr>
+          <tr><td style="color:var(--dim);padding:3px 0">MEV Protection</td><td style="color:${S.cfg.mev?'var(--green)':'var(--dim)'};text-align:right">${S.cfg.mev?'✓ Activ':'✗ Dezactivat'}</td></tr>
+        </table>
+        <div style="background:rgba(255,50,50,.08);border:1px solid rgba(255,50,50,.3);border-radius:5px;padding:8px;margin-bottom:14px;font-size:10px;color:var(--yellow)">
+          ⚠️ Acesta este un trade REAL cu fonduri reale. Verifică datele înainte de confirmare.
+        </div>
+        <div style="display:flex;gap:10px">
+          <button onclick="document.getElementById('tradeConfirmModal').remove();window._tradeConfirmResolve(false)"
+            style="flex:1;padding:10px;background:rgba(255,255,255,.05);border:1px solid var(--brd);border-radius:5px;color:var(--fg);cursor:pointer;font-size:12px">
+            ✗ Anulează
+          </button>
+          <button onclick="document.getElementById('tradeConfirmModal').remove();window._tradeConfirmResolve(true)"
+            style="flex:1;padding:10px;background:rgba(255,50,50,.2);border:1px solid var(--red);border-radius:5px;color:var(--red);cursor:pointer;font-size:13px;font-weight:bold">
+            ✓ CONFIRMĂ TRADE
+          </button>
+        </div>
+      </div>`;
+    document.body.appendChild(modal);
+    window._tradeConfirmResolve = resolve;
+  });
+}
+
+// ═══════════════════════════════════════════════════════════════
+// SAFEGUARDS — stop-loss + cooldown
+// ═══════════════════════════════════════════════════════════════
+function checkSafeguards(opp) {
+  // Stop-loss
+  if (S.cfg.stopLoss < 0 && S.pnl <= S.cfg.stopLoss) {
+    log('WARN', `🛑 STOP-LOSS ACTIVAT: P&L $${S.pnl.toFixed(2)} ≤ $${S.cfg.stopLoss} — trading oprit`);
+    S.running = false;
+    setDot('dRun','dead'); setText('lRun','STOP');
+    playAlert('warning');
+    return false;
+  }
+  // Cooldown
+  const secsSinceLast = (Date.now() - S.lastTradeTs) / 1000;
+  if (S.lastTradeTs > 0 && secsSinceLast < S.cfg.cooldownSec) {
+    log('SYS', `⏳ Cooldown: ${(S.cfg.cooldownSec - secsSinceLast).toFixed(0)}s rămași`);
+    return false;
+  }
+  // Max trade size
+  if (opp.cap > S.cfg.maxTradeUSD) {
+    log('WARN', `⚠️ Trade size $${opp.cap} > maxTradeUSD $${S.cfg.maxTradeUSD}`);
+    return false;
+  }
+  return true;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// DISCONNECT WALLET
+// ═══════════════════════════════════════════════════════════════
+function disconnectEVM() {
+  S.wallet.evmConnected = false;
+  S.wallet.evmAddress   = null;
+  S.wallet.evmBalance   = 0;
+  S.wallet.usdcBalance  = 0;
+  S.wallet.chainId      = null;
+  // Reset balante la mock dacă mockMode activ
+  if (S.cfg.mockMode) loadMockBalances();
+  else Object.keys(S.wallet.balances).forEach(k => S.wallet.balances[k] = { eth:0, usdc:0, loaded:false });
+  log('SYS', '🔌 MetaMask deconectat');
+  if (activePane === 'settings') renderSettings();
+}
+
+function disconnectPhantom() {
+  S.wallet.solConnected = false;
+  S.wallet.solAddress   = null;
+  if (window.solana?.disconnect) window.solana.disconnect().catch(()=>{});
+  if (S.cfg.mockMode) S.wallet.balances.sol = { ...MOCK_BALANCES.sol, loaded:true, mock:true };
+  log('SYS', '🔌 Phantom deconectat');
+  if (activePane === 'settings') renderSettings();
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RENDER BALANCE PANEL (Settings)
+// ═══════════════════════════════════════════════════════════════
+function renderBalancePanel() {
+  const chains = [
+    { id:'arb',  label:'Arbitrum',  color:'#28A0F0', native:'ETH',   nKey:'eth'  },
+    { id:'base', label:'Base',      color:'#0052FF', native:'ETH',   nKey:'eth'  },
+    { id:'op',   label:'Optimism',  color:'#FF0420', native:'ETH',   nKey:'eth'  },
+    { id:'poly', label:'Polygon',   color:'#8247E5', native:'MATIC', nKey:'matic'},
+    { id:'bsc',  label:'BSC',       color:'#F0B90B', native:'BNB',   nKey:'bnb'  },
+    { id:'sol',  label:'Solana',    color:'#9945FF', native:'SOL',   nKey:'sol'  },
+  ];
+  const isMock = S.cfg.mockMode;
+  const rows = chains.map(ch => {
+    const b = S.wallet.balances[ch.id];
+    const loaded = b?.loaded;
+    const mock = b?.mock;
+    const lat = S.wsLatency[ch.id];
+    const lastP = S.wsLastPrice[ch.id];
+    const ageS = lastP ? ((Date.now()-lastP)/1000).toFixed(0) : '—';
+    const nativePx = ch.id==='sol' ? (realSol||85) : ch.id==='bsc'&&ch.nKey==='bnb' ? 600 : (realEth||2020);
+    const nativeVal = loaded ? (b[ch.nKey]||0)*nativePx : 0;
+    const usdcVal   = loaded ? (b.usdc||0) : 0;
+    const totalUSD  = nativeVal + usdcVal;
+    return `
+      <div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr 70px;align-items:center;gap:4px;
+                  padding:5px 6px;border-bottom:1px solid rgba(255,255,255,.04);font-size:10px">
+        <div>
+          <span style="display:inline-block;width:7px;height:7px;border-radius:50%;background:${ch.color};margin-right:4px"></span>
+          <span style="color:var(--fg)">${ch.label}</span>
+          ${mock ? '<span style="color:var(--yellow);font-size:8px"> MOCK</span>' : ''}
+        </div>
+        <div style="color:var(--cyan);text-align:right">${loaded?(b[ch.nKey]||0).toFixed(4):'-'} ${ch.native}</div>
+        <div style="color:var(--green);text-align:right">${loaded?'$'+(b.usdc||0).toFixed(2):'-'} USDC</div>
+        <div style="color:var(--fg);text-align:right;font-weight:bold">${loaded?'$'+totalUSD.toFixed(2):'-'}</div>
+        <div style="text-align:right">
+          <span style="color:${getLatencyColor(lat)};font-size:9px">${lat!=null?lat+'ms':'—'}</span><br>
+          <span style="color:var(--dim);font-size:8px">${ageS}s</span>
+        </div>
+      </div>`;
+  }).join('');
+
+  const totalAll = chains.reduce((sum, ch) => {
+    const b = S.wallet.balances[ch.id];
+    if (!b?.loaded) return sum;
+    const nativePx = ch.id==='sol'?(realSol||85):ch.id==='bsc'&&ch.nKey==='bnb'?600:(realEth||2020);
+    return sum + (b[ch.nKey]||0)*nativePx + (b.usdc||0);
+  }, 0);
+
+  return `
+    <div style="background:rgba(0,255,150,.04);border:1px solid rgba(0,255,150,.15);border-radius:6px;
+                overflow:hidden;margin-bottom:10px">
+      <!-- header -->
+      <div style="display:flex;align-items:center;justify-content:space-between;
+                  padding:7px 10px;background:rgba(0,255,150,.06);border-bottom:1px solid rgba(0,255,150,.1)">
+        <div style="font-size:9px;color:var(--green);letter-spacing:1px">
+          💰 BALANȚE — ${isMock?'<span style="color:var(--yellow)">🧪 MOD TEST</span>':'LIVE'}
+        </div>
+        <div style="display:flex;gap:6px;align-items:center">
+          <span style="font-size:10px;color:var(--fg)">Total: <b style="color:var(--green)">$${totalAll.toFixed(2)}</b></span>
+          <button onclick="if(S.cfg.mockMode){loadMockBalances();}else if(S.wallet.evmAddress){loadLiveBalances(S.wallet.evmAddress);}"
+            style="padding:2px 7px;background:rgba(0,255,150,.15);border:1px solid var(--green);
+                   border-radius:3px;color:var(--green);cursor:pointer;font-size:9px">↺ Refresh</button>
+        </div>
+      </div>
+      <!-- column headers -->
+      <div style="display:grid;grid-template-columns:90px 1fr 1fr 1fr 70px;gap:4px;
+                  padding:4px 6px;font-size:8px;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.04)">
+        <div>CHAIN</div><div style="text-align:right">NATIVE</div>
+        <div style="text-align:right">USDC</div><div style="text-align:right">TOTAL USD</div>
+        <div style="text-align:right">LATENCY / AGE</div>
+      </div>
+      ${rows}
+    </div>`;
+}
+
+// ═══════════════════════════════════════════════════════════════
+// RENDER WSS STATUS PANEL (tab nou sau inline)
+// ═══════════════════════════════════════════════════════════════
+function renderWssStatusPanel() {
+  const chains = ['arb','base','op','poly','bsc','sol'];
+  const rows = chains.map(id => {
+    const lat = S.wsLatency[id];
+    const lastP = S.wsLastPrice[id];
+    const ageMs = lastP ? Date.now()-lastP : null;
+    const ageS = ageMs !== null ? (ageMs/1000).toFixed(1)+'s' : '—';
+    const px = PX[id]?.['ETH/USDC'] || PX[id]?.['SOL/USDC'] || null;
+    const ch = CHAINS.find(c=>c.id===id);
+    return `<div style="display:flex;align-items:center;gap:8px;padding:4px 8px;font-size:10px;border-bottom:1px solid rgba(255,255,255,.04)">
+      <span style="width:8px;height:8px;border-radius:50%;background:${lat<100?'var(--green)':lat<300?'var(--yellow)':'var(--red)'};flex-shrink:0"></span>
+      <span style="width:55px;color:var(--fg)">${(ch?.name||id).slice(0,10)}</span>
+      <span style="width:55px;color:${getLatencyColor(lat)}">${lat!=null?lat+'ms':'–'}</span>
+      <span style="width:55px;color:var(--dim)">${ageS} ago</span>
+      <span style="color:var(--cyan);flex:1;text-align:right">${px?'$'+px.toLocaleString(undefined,{maximumFractionDigits:2}):'—'}</span>
+    </div>`;
+  }).join('');
+  return `<div data-wss-panel="1" style="background:rgba(0,150,200,.04);border:1px solid rgba(0,150,200,.2);border-radius:6px;overflow:hidden;margin-bottom:10px">
+    <div style="padding:6px 10px;background:rgba(0,150,200,.07);font-size:9px;color:var(--cyan);letter-spacing:1px;
+                display:flex;justify-content:space-between">
+      <span>📡 WSS STATUS — LATENȚĂ & PREȚURI LIVE</span>
+      <span style="color:var(--dim)">auto-refresh 3s</span>
+    </div>
+    <div style="display:flex;gap:8px;padding:4px 8px;font-size:8px;color:var(--dim);border-bottom:1px solid rgba(255,255,255,.06)">
+      <span style="width:8px"></span><span style="width:55px">CHAIN</span>
+      <span style="width:55px">LATENCY</span><span style="width:55px">LAST MSG</span>
+      <span style="flex:1;text-align:right">LAST PRICE</span>
+    </div>
+    ${rows}
+  </div>`;
+}
+
+
 function renderMetaMaskFileBanner() {
   if (window.location.protocol !== 'file:' || typeof window.ethereum !== 'undefined') return '';
   return '<div style="background:rgba(255,150,0,.1);border:1px solid rgba(255,150,0,.4);border-radius:4px;padding:8px;margin-bottom:8px;font-size:10px;color:var(--yellow)">'
@@ -3398,6 +3746,68 @@ function renderMetaMaskFileBanner() {
     + '3. Activeaza <b>"Permite accesul la URL-uri de fisier"</b><br>'
     + '4. Reincarca aceasta pagina (F5)'
     + '</div>';
+}
+
+
+
+function copyExtUrl() {
+  const url = 'chrome://extensions';
+  if (navigator.clipboard) {
+    navigator.clipboard.writeText(url).then(() => {
+      alert('Copiat!\nLipeste cu Ctrl+V in bara de adrese Chrome si apasa Enter.');
+    }).catch(() => { prompt('Copiaza manual (Ctrl+C):', url); });
+  } else { prompt('Copiaza manual (Ctrl+C):', url); }
+}
+
+function update1inchKey(val) {
+  S.cfg.oneInchKey = val.trim();
+  const el = document.getElementById('oneInchKeyStatus');
+  if (el) { el.textContent = '⏳ Cheie actualizată — apasă TEST'; el.style.color = 'var(--yellow)'; }
+}
+
+async function test1inchKey() {
+  const key = S.cfg.oneInchKey;
+  const el = document.getElementById('oneInchKeyStatus');
+  if (!key) { if(el){el.textContent='❌ Introdu cheia înainte de test';el.style.color='var(--red)';} return; }
+  if(el){el.textContent='⏳ Testare...';el.style.color='var(--yellow)';}
+  try {
+    const r = await fetch('https://api.1inch.dev/swap/v6.0/42161/quote?src=0xFF970A61A04b1cA14834A43f5dE4533eBDDB5CC8&dst=0x82aF49447D8a07e3bd95BD0d56f35241523fBab1&amount=100000000', {
+      headers:{'Authorization':'Bearer '+key,'Accept':'application/json'},
+      signal: AbortSignal.timeout(5000),
+    });
+    if(r.ok){
+      if(el){el.textContent='✅ Cheie validă — swap live activ!';el.style.color='var(--green)';}
+      log('SYS','✅ 1inch API key valid');
+    } else {
+      const err=await r.json().catch(()=>({}));
+      if(el){el.textContent='❌ Invalida: '+(err.description||r.status);el.style.color='var(--red)';}
+    }
+  } catch(e){ if(el){el.textContent='❌ '+e.message;el.style.color='var(--red)';} }
+}
+
+function getHeliusUrl(type) {
+  const key = S.cfg.heliusKey||'';
+  if(!key) return type==='wss'?'wss://api.mainnet-beta.solana.com':'https://api.mainnet-beta.solana.com';
+  return type==='wss'
+    ? 'wss://mainnet.helius-rpc.com/?api-key='+key
+    : 'https://mainnet.helius-rpc.com/?api-key='+key;
+}
+
+function toggleMockMode(enabled) {
+  S.cfg.mockMode = enabled;
+  if (enabled) {
+    loadMockBalances();
+    log('SYS', '🧪 Mock Mode ON — balanțe simulate active');
+  } else {
+    if (S.wallet.evmAddress) {
+      loadLiveBalances(S.wallet.evmAddress);
+      log('SYS', '💰 Mock Mode OFF — încărc balanțe live...');
+    } else {
+      log('SYS', '💰 Mock Mode OFF — conectează wallet pentru balanțe live');
+      Object.keys(S.wallet.balances).forEach(k => S.wallet.balances[k] = { eth:0, usdc:0, loaded:false });
+    }
+  }
+  if (activePane === 'settings') renderSettings();
 }
 
 function renderDbgDetect() {
@@ -3444,26 +3854,6 @@ function renderSettings() {
       </div>
     </div>
 
-    <!-- 1INCH API KEY ─────────────────────────────────────────── -->
-    <div style="background:rgba(255,50,50,.04);border:1px solid rgba(255,50,50,.2);border-radius:6px;padding:10px;margin-bottom:10px">
-      <div style="font-size:9px;color:var(--red);letter-spacing:1px;margin-bottom:6px">🔴 1INCH API KEY — SWAP EXECUȚIE LIVE</div>
-      <div style="display:flex;gap:6px;align-items:center;margin-bottom:6px">
-        <input id="oneInchKeyInput" type="password"
-          style="flex:1;background:var(--bg2);border:1px solid var(--brd);border-radius:4px;padding:5px 8px;color:var(--fg);font-size:11px;font-family:monospace"
-          placeholder="Paste API key de la portal.1inch.dev..."
-          value="${S.cfg.oneInchKey || ''}"
-          oninput="update1inchKey(this.value)"
-        />
-        <button onclick="test1inchKey()" style="padding:4px 10px;background:rgba(255,50,50,.2);border:1px solid var(--red);border-radius:4px;color:var(--red);cursor:pointer;font-size:10px">TEST</button>
-      </div>
-      <div id="oneInchKeyStatus" style="font-size:9px;color:var(--dim);margin-bottom:3px">
-        ${S.cfg.oneInchKey ? '✓ Cheie setată — execuție live activă' : '⚠ Fără cheie: quote disponibil, swap dezactivat'}
-      </div>
-      <div style="font-size:9px;color:var(--dim)">
-        Gratuit la <span style="color:var(--red)">portal.1inch.dev</span> · 10k req/lună incluse
-      </div>
-    </div>
-
     <!-- DEBUG DETECT() ──────────────────────────────────────── -->
     <div style="background:rgba(255,200,0,.04);border:1px solid rgba(255,200,0,.15);border-radius:6px;padding:10px;margin-bottom:10px">
       <div style="font-size:9px;color:var(--yellow);letter-spacing:1px;margin-bottom:6px">🔍 DEBUG DETECT() — DE CE NU APAR OPP-URI</div>
@@ -3472,26 +3862,51 @@ function renderSettings() {
       </div>
     </div>
 
+    <!-- MOCK MODE TOGGLE ─────────────────────────────────────── -->
+    <div style="background:rgba(255,200,0,.05);border:1px solid rgba(255,200,0,.2);border-radius:6px;padding:8px 10px;margin-bottom:8px;display:flex;align-items:center;justify-content:space-between">
+      <div>
+        <div style="font-size:10px;color:var(--yellow);font-weight:bold">🧪 MOD TEST (Mock Balances)</div>
+        <div style="font-size:9px;color:var(--dim);margin-top:2px">Balanțe simulate — fără wallet necesar</div>
+      </div>
+      <label style="cursor:pointer;display:flex;align-items:center;gap:6px">
+        <input type="checkbox" ${S.cfg.mockMode?'checked':''} onchange="toggleMockMode(this.checked)"
+          style="width:14px;height:14px;cursor:pointer">
+        <span style="font-size:10px;color:${S.cfg.mockMode?'var(--yellow)':'var(--dim)'}">${S.cfg.mockMode?'ON':'OFF'}</span>
+      </label>
+    </div>
+
     <div class="wallet-panel">
       <div style="font-size:9px;color:var(--dim);letter-spacing:1px;margin-bottom:5px">WALLET STATUS (LIVE TRADING)</div>
       ${renderMetaMaskFileBanner()}
-      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:4px">
+      <!-- EVM Row -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:6px">
         <span class="${S.wallet.evmConnected?'wallet-connected':'wallet-disconnected'}">
-          ${S.wallet.evmConnected?`✓ EVM: ${S.wallet.evmAddress?.slice(0,6)}...${S.wallet.evmAddress?.slice(-4)}`:'○ EVM: Neconectat'}
+          ${S.wallet.evmConnected
+            ? '✓ ' + S.wallet.evmAddress?.slice(0,6)+'...'+S.wallet.evmAddress?.slice(-4)
+            : '○ EVM: Neconectat'}
         </span>
-        <button class="btn bG bSm" onclick="connectEVM()" ${S.wallet.evmConnected?'disabled':''}>
-          ${S.wallet.evmConnected?'Conectat':'MetaMask'}
-        </button>
+        <div style="display:flex;gap:4px">
+          ${S.wallet.evmConnected
+            ? '<button class="btn bSm" style="border-color:var(--red);color:var(--red)" onclick="disconnectEVM()">⏏ Deconectează</button>'
+            : '<button class="btn bG bSm" onclick="connectEVM()">MetaMask</button>'}
+        </div>
       </div>
-      <div style="display:flex;justify-content:space-between;align-items:center">
+      <!-- SOL Row -->
+      <div style="display:flex;justify-content:space-between;align-items:center;margin-bottom:8px">
         <span class="${S.wallet.solConnected?'wallet-connected':'wallet-disconnected'}">
-          ${S.wallet.solConnected?`✓ SOL: ${S.wallet.solAddress?.slice(0,6)}...`:'○ Solana: Neconectat'}
+          ${S.wallet.solConnected
+            ? '✓ SOL: ' + S.wallet.solAddress?.slice(0,6)+'...'
+            : '○ Solana: Neconectat'}
         </span>
-        <button class="btn bSm" style="border-color:var(--sol);color:var(--sol)" onclick="connectPhantom()" ${S.wallet.solConnected?'disabled':''}>
-          ${S.wallet.solConnected?'Conectat':'Phantom'}
-        </button>
+        <div style="display:flex;gap:4px">
+          ${S.wallet.solConnected
+            ? '<button class="btn bSm" style="border-color:var(--red);color:var(--red)" onclick="disconnectPhantom()">⏏ Deconectează</button>'
+            : '<button class="btn bSm" style="border-color:var(--sol);color:var(--sol)" onclick="connectPhantom()">Phantom</button>'}
+        </div>
       </div>
-      <div style="font-size:9px;color:var(--dim);margin-top:4px">Simulare activă — conexiunea wallet e necesară doar pentru live trading</div>
+      <div style="font-size:9px;color:var(--dim);margin-top:4px">
+        ${S.cfg.mockMode ? '🧪 Mod Test activ — balanțe simulate' : 'Live mode — conectează wallet pentru balanțe reale'}
+      </div>
       ${S.wallet.evmConnected ? '<div style="font-size:10px;margin-top:5px;padding:4px;background:rgba(0,255,0,.05);border:1px solid rgba(0,255,0,.2);border-radius:3px">'
         + '<span style="color:var(--green)">ETH: ' + (S.wallet.evmBalance||0).toFixed(4) + '</span>'
         + ' &nbsp; <span style="color:var(--cyan)">USDC: $' + (S.wallet.usdcBalance||0).toFixed(2) + '</span>'
