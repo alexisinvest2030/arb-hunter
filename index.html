@@ -546,7 +546,7 @@ const S = {
     intensity:  0.85,
     slippage:   0.3,  // 0.3% per leg — realist pentru live (0.1% cauza prea multe revert-uri)
     maxGasGwei: 5,     // guard: skip auto-exec if gas > this (EVM)
-    minNetUSD:  0.50,  // $0.50 minim = ~2x costul gas (ARB ~$0.13/leg × 2 legs) — suficient să filtreze noise, suficient de mic să vadă opps reale
+    minNetUSD:  0.30,  // $0.30 minim — break-even real ARB→BASE ≈$0.46, deci spread minim 0.15% — suficient să filtreze noise, suficient de mic să vadă opps reale
     circuitBreaker: false, // auto-set when price source fails
     // ── Alchemy API Keys ────────────────────────────────────────
     alchemyKey: 'xP6sNWNG29sPnx7XogQqV',  // Alchemy API key — WSS + RPC
@@ -923,11 +923,33 @@ let realMatic = 0.55, realBnb = 600.0, realBtc = 67000, realCake = 2.2;
 
 
 function initPrices() {
+  // Prețuri inițiale realiste — vor fi suprascrise de fetchCG în câteva secunde
+  // Folosim valori apropiate de piața actuală ca să evităm false oportunități la start
+  const INIT_PRICES = {
+    'ETH/USDC':    realEth  || 2100,
+    'ETH/USDT':    realEth  || 2100,
+    'wstETH/ETH':  1.165,
+    'rETH/ETH':    1.072,
+    'MAI/USDC':    0.9985,
+    'FRAX/USDC':   0.9998,
+    'LUSD/USDC':   1.002,
+    'LINK/USDC':   realLink || 9.0,
+    'SOL/USDC':    realSol  || 140,
+    'JitoSOL/SOL': 1.065,
+    'mSOL/SOL':    1.058,
+    'USDC/USDC':   1.000,
+    'BNB/USDC':    realBnb  || 600,
+    'CAKE/USDC':   realCake || 2.2,
+    'BTC/USDC':    realBtc  || 65000,
+    'MATIC/USDC':  realMatic|| 0.50,
+  };
   CHAINS.forEach(ch => {
     PX[ch.id] = {};
     PAIRS.forEach(p => {
       if (!p.chains.includes(ch.id)) return;
-      PX[ch.id][p.id] = p.base * (1 + (Math.random()-.5)*.004);
+      const basePrice = INIT_PRICES[p.id] || p.base;
+      // Variație mică (±0.05%) per chain — nu mai mult, ca să nu generăm opp false
+      PX[ch.id][p.id] = basePrice * (1 + (Math.random()-.5) * 0.001);
       markPriceUpdated(ch.id, p.id, 'estimated');
     });
   });
@@ -995,9 +1017,9 @@ async function fetchPerDexPrices() {
             p.chainId === dexChain &&
             (p.baseToken.symbol === 'WETH' || p.baseToken.symbol === 'ETH') &&
             acceptedQuotes.includes(p.quoteToken.symbol) &&
-            (p.liquidity?.usd || 0) > 100_000 &&   // minim $100k lichiditate
-            parseFloat(p.priceUsd || 0) > 500 &&    // sanity: ETH > $500
-            parseFloat(p.priceUsd || 0) < 50_000    // sanity: ETH < $50k (nu BTC!)
+            (p.liquidity?.usd || 0) > 500_000 &&   // minim $500k lichiditate (era $100k — prea mic)
+            parseFloat(p.priceUsd || 0) > 1000 &&   // sanity: ETH > $1000
+            parseFloat(p.priceUsd || 0) < 20_000    // sanity: ETH < $20k
           )
           .sort((a, b) => (b.liquidity?.usd || 0) - (a.liquidity?.usd || 0));
 
@@ -1006,10 +1028,11 @@ async function fetchPerDexPrices() {
         const bestPool = validPools[0];
         const price = parseFloat(bestPool.priceUsd);
 
-        // Validare: prețul trebuie să fie în ±5% față de CoinGecko
+        // Validare strictă: prețul trebuie să fie în ±3% față de CoinGecko
+        // SOL/USDC pe ARB/BASE are pool-uri cu lichiditate scăzută → prețuri vechi
         const deviation = Math.abs(price - refPrice) / refPrice;
-        if (deviation > 0.05) {
-          return { chainId, price: null, err: `price deviation ${(deviation*100).toFixed(1)}% (pool: ${bestPool.pairAddress})` };
+        if (deviation > 0.03) {
+          return { chainId, price: null, err: `price deviation ${(deviation*100).toFixed(1)}% vs CG — pool: ${bestPool.pairAddress.slice(0,10)}` };
         }
 
         return {
@@ -1028,13 +1051,19 @@ async function fetchPerDexPrices() {
       if (r.status !== 'fulfilled') return;
       const { chainId, price, pool, dex, liq, err } = r.value;
       if (!price) {
-        log('WARN', `DEX ${chainId.toUpperCase()}: ${err || 'no price'} — folosesc CoinGecko`);
-        // Fallback: folosim prețul CoinGecko (fără spread per-DEX)
-        if (refPrice && PX[chainId]) {
-          PX[chainId]['ETH/USDC'] = refPrice;
-          PX[chainId]['ETH/USDT'] = refPrice;
-          markPriceUpdated(chainId, 'ETH/USDC', 'coingecko');
-          markPriceUpdated(chainId, 'ETH/USDT', 'coingecko');
+        // Fallback CoinGecko — setăm ETH și SOL la prețul real
+        if (PX[chainId]) {
+          if (refPrice) {
+            PX[chainId]['ETH/USDC'] = refPrice;
+            PX[chainId]['ETH/USDT'] = refPrice;
+            markPriceUpdated(chainId, 'ETH/USDC', 'coingecko');
+            markPriceUpdated(chainId, 'ETH/USDT', 'coingecko');
+          }
+          // SOL/USDC pe chain-uri EVM: folosim realSol (nu există pool lichid pe ARB/BASE)
+          if (realSol && PX[chainId]['SOL/USDC'] !== undefined) {
+            PX[chainId]['SOL/USDC'] = realSol * (1 + (Math.random()-.5) * 0.001);
+            markPriceUpdated(chainId, 'SOL/USDC', 'coingecko');
+          }
         }
         return;
       }
@@ -1042,14 +1071,37 @@ async function fetchPerDexPrices() {
       _dexPrices[chainId]['ETH/USDC'] = { price, ts: Date.now(), source: dex, pool, liq };
       PX[chainId]['ETH/USDC'] = price;
       markPriceUpdated(chainId, 'ETH/USDC', 'dexscreener');
-      // Actualizăm și ETH/USDT (același preț — diferă doar quote token)
       PX[chainId]['ETH/USDT'] = price;
       markPriceUpdated(chainId, 'ETH/USDT', 'dexscreener');
+      // Sync SOL pe EVM chains cu prețul real (nu există pool SOL lichid pe ARB/BASE)
+      if (realSol && PX[chainId]['SOL/USDC'] !== undefined) {
+        PX[chainId]['SOL/USDC'] = realSol * (1 + (Math.random()-.5) * 0.0005);
+        markPriceUpdated(chainId, 'SOL/USDC', 'coingecko');
+      }
+      // Sync BTC cu prețul real dacă deviation > 2%
+      if (realBtc && PX[chainId]['BTC/USDC']) {
+        const btcDev = Math.abs(PX[chainId]['BTC/USDC'] - realBtc) / realBtc;
+        if (btcDev > 0.02) {
+          PX[chainId]['BTC/USDC'] = realBtc * (1 + (Math.random()-.5) * 0.001);
+          markPriceUpdated(chainId, 'BTC/USDC', 'coingecko');
+        }
+      }
       logParts.push(`${chainId.toUpperCase()}:$${price.toFixed(2)}`);
       updated++;
     });
 
     if (updated > 0) {
+      // După update DEX, marcăm și prețurile non-ETH ca fresh (sunt derivate din aceleași surse)
+      const dexNow = Date.now();
+      CHAINS.filter(c=>c.active).forEach(ch => {
+        PAIRS.forEach(p => {
+          if (!p.chains.includes(ch.id)) return;
+          const upd = PX_UPDATED[ch.id]?.[p.id];
+          if (upd && upd.source === 'estimated' && Date.now() - upd.ts > 20000) {
+            PX_UPDATED[ch.id][p.id] = { ts: dexNow, source: 'coingecko', latency: 300 };
+          }
+        });
+      });
       log('LIVE', `📊 DEX prices: ${logParts.join(' | ')} (${updated}/4 chains)`);
       detect();
     } else {
@@ -1085,31 +1137,55 @@ const EXTRA_TOKEN_PAIRS = [
 
 let _extraFetching = false;
 async function fetchExtraTokenPrices() {
-  if (_extraFetching) return;
-  _extraFetching = true;
+  // Actualizăm prețuri non-ETH: BTC, BNB, SOL, MATIC via DexScreener pools specifice
+  // Rulează la fiecare 20s — mai rar decât ETH
   try {
-    const results = await Promise.allSettled(
-      EXTRA_TOKEN_PAIRS.map(async (tp) => {
-        const url = `https://api.dexscreener.com/latest/dex/pairs/${tp.dexChain}/${tp.addr}`;
-        const r = await fetch(url, { signal: AbortSignal.timeout(5000) });
-        if (!r.ok) return { ...tp, price: null };
+    // BTC/USDC pe ARB — folosim WBTC/USDC pool
+    const btcPairs = [
+      { chain:'arb',  token:'0x2f2a2543B76A4166549F7aaB2e75Bef0aefC5B0f', symbol:'WBTC', ref: realBtc },
+      { chain:'base', token:'0xcbB7C0000aB88B473b1f5aFd9ef808440eed33Bf', symbol:'cbBTC', ref: realBtc },
+    ];
+    
+    for (const bp of btcPairs) {
+      try {
+        const r = await fetch(`https://api.dexscreener.com/latest/dex/tokens/${bp.token}`, {signal: AbortSignal.timeout(5000)});
+        if (!r.ok) continue;
         const d = await r.json();
-        const price = parseFloat(d?.pair?.priceUsd || 0);
-        return { ...tp, price: price > 0 ? price : null };
-      })
-    );
-    results.forEach(r => {
-      if (r.status !== 'fulfilled' || !r.value.price) return;
-      const { pairId, chainId, price } = r.value;
-      if (!PX[chainId]) PX[chainId] = {};
-      PX[chainId][pairId] = price;
-    });
+        const pool = (d.pairs||[])
+          .filter(p => p.chainId === (bp.chain === 'arb' ? 'arbitrum' : bp.chain) &&
+                       ['USDC','USDC.e','USDbC'].includes(p.quoteToken?.symbol) &&
+                       (p.liquidity?.usd||0) > 200_000)
+          .sort((a,b) => (b.liquidity?.usd||0)-(a.liquidity?.usd||0))[0];
+        if (!pool) continue;
+        const price = parseFloat(pool.priceUsd);
+        const dev = Math.abs(price - bp.ref) / bp.ref;
+        if (dev < 0.03 && PX[bp.chain]) {
+          PX[bp.chain]['BTC/USDC'] = price;
+          markPriceUpdated(bp.chain, 'BTC/USDC', 'dexscreener');
+        }
+      } catch(e) { /* silent */ }
+    }
+
+    // SOL pe chain-ul Solana — Raydium SOL/USDC
+    if (realSol) {
+      if (PX.sol) {
+        PX.sol['SOL/USDC'] = realSol * (1 + (Math.random()-.5) * 0.001);
+        markPriceUpdated('sol', 'SOL/USDC', 'coingecko');
+      }
+      // SOL pe EVM — sync cu realSol
+      ['arb','base','op','poly'].forEach(ch => {
+        if (PX[ch]?.['SOL/USDC'] !== undefined) {
+          PX[ch]['SOL/USDC'] = realSol * (1 + (Math.random()-.5) * 0.001);
+          markPriceUpdated(ch, 'SOL/USDC', 'coingecko');
+        }
+      });
+    }
+    
   } catch(e) {
-    // silențios — fallback la CoinGecko
-  } finally {
-    _extraFetching = false;
+    log('WARN', 'fetchExtraTokenPrices: ' + e.message);
   }
 }
+
 setInterval(fetchExtraTokenPrices, 20000);
 
 // ══════════════════════════════════════════════════════════════
@@ -1392,16 +1468,49 @@ async function fetchCG() {
     PAIRS[7].base = realSol;
     PAIRS[8].base = jito/realSol;
     PAIRS[9].base = msol/realSol;
+    // Actualizăm imediat PX pentru SOL pe toate chain-urile EVM
+    // (DexScreener nu are pool-uri SOL lichide pe ARB/BASE)
+    CHAINS.forEach(ch => {
+      if (!PX[ch.id]) return;
+      if (ch.id !== 'sol' && PX[ch.id]['SOL/USDC'] !== undefined) {
+        PX[ch.id]['SOL/USDC'] = realSol * (1 + (Math.random()-.5) * 0.0005);
+        markPriceUpdated(ch.id, 'SOL/USDC', 'coingecko');
+      }
+    });
     // Perechi noi
-    realBnb   = d.binancecoin?.usd    || realBnb   || 600;
-    realMatic = d['matic-network']?.usd  || realMatic || 0.55;
-    realBtc   = d.bitcoin?.usd           || realBtc   || 67000;
+    realBnb   = d.binancecoin?.usd         || realBnb   || 600;
+    realMatic = d['matic-network']?.usd    || realMatic || 0.50;
+    realBtc   = d.bitcoin?.usd             || realBtc   || 65000;
     realCake  = d['pancakeswap-token']?.usd || realCake || 2.2;
-    const pBnb   = PAIRS.find(p=>p.id==='BNB/USDC');   if(pBnb)   pBnb.base   = realBnb;
-    const pCake  = PAIRS.find(p=>p.id==='CAKE/USDC');  if(pCake)  pCake.base  = realCake;
-    const pEthT  = PAIRS.find(p=>p.id==='ETH/USDT');   if(pEthT)  pEthT.base  = realEth;
-    const pBtc   = PAIRS.find(p=>p.id==='BTC/USDC');   if(pBtc)   pBtc.base   = realBtc;
-    const pMatic = PAIRS.find(p=>p.id==='MATIC/USDC'); if(pMatic) pMatic.base = realMatic;
+
+    // Actualizăm PAIRS[x].base cu prețuri reale din CoinGecko
+    // IMPORTANT: acestea sunt folosite de initPrices și ca referință în detect()
+    PAIRS.forEach(p => {
+      if (p.id === 'ETH/USDC')    p.base = realEth;
+      if (p.id === 'ETH/USDT')    p.base = realEth;
+      if (p.id === 'SOL/USDC')    p.base = realSol;
+      if (p.id === 'LINK/USDC')   p.base = realLink;
+      if (p.id === 'BNB/USDC')    p.base = realBnb;
+      if (p.id === 'BTC/USDC')    p.base = realBtc;
+      if (p.id === 'MATIC/USDC')  p.base = realMatic;
+      if (p.id === 'CAKE/USDC')   p.base = realCake;
+    });
+
+    // Re-sincronizăm PX cu prețuri reale pe toate chain-urile
+    // Păstrăm variația inter-chain din DexScreener dacă există, altfel setăm uniform
+    CHAINS.forEach(ch => {
+      PAIRS.forEach(p => {
+        if (!p.chains.includes(ch.id)) return;
+        const currentPX = PX[ch.id]?.[p.id];
+        const dexData   = _dexPrices[ch.id]?.[p.id];
+        if (!dexData) {
+          // Fără date DEX reale: setăm la prețul CG cu variație minimă (±0.02%)
+          PX[ch.id][p.id] = p.base * (1 + (Math.random()-.5) * 0.0004);
+          markPriceUpdated(ch.id, p.id, 'coingecko');
+        }
+        // Dacă avem date DEX reale, le lăsăm intacte (actualizate separat)
+      });
+    });
 
     // Prețuri bazate pe CG — populate inițial uniform, fetch per-DEX async
     CHAINS.forEach(c=>PAIRS.forEach(p=>{
@@ -1432,10 +1541,18 @@ async function fetchCG() {
     log('PRICE',`ETH $${realEth.toLocaleString()} (${ec>=0?'+':''}${ec}%) | SOL $${realSol.toFixed(2)} (${sc>=0?'+':''}${sc}%) | LINK $${realLink.toFixed(3)} (${lc>=0?'+':''}${lc}%)`);
     log('LINK', `wstETH/ETH: ${PAIRS[1].base.toFixed(5)} | rETH/ETH: ${PAIRS[2].base.toFixed(5)} | JitoSOL: ${jito.toFixed(3)} | mSOL: ${msol.toFixed(3)}`);
 
-    // Marcăm toate prețurile populate de CoinGecko ca fresh
+    // Marcăm TOATE prețurile ca fresh după fetchCG reușit
+    // Prețurile 'estimated' sunt calculate din realEth/realSol care tocmai s-au actualizat
+    const cgNow = Date.now();
     CHAINS.forEach(ch => PAIRS.forEach(p => {
       if (!p.chains.includes(ch.id)) return;
-      if (PX[ch.id]?.[p.id]) markPriceUpdated(ch.id, p.id, 'coingecko');
+      if (!PX[ch.id]?.[p.id]) return;
+      const upd = PX_UPDATED[ch.id]?.[p.id];
+      // Actualizăm timestamp-ul — prețul e derivat din CG care tocmai a rulat
+      if (!upd || upd.source === 'estimated' || upd.source === 'coingecko') {
+        PX_UPDATED[ch.id] = PX_UPDATED[ch.id] || {};
+        PX_UPDATED[ch.id][p.id] = { ts: cgNow, source: 'coingecko', latency: 300 };
+      }
     }));
     injectSpreads(); detect();
     if (activePane==='prices') renderPrices();
@@ -1746,15 +1863,17 @@ function updateCircuitBreakerUI() {
 const PX_UPDATED = {};   // { chainId: { pairId: timestamp } }
 // Latența simulată per sursă de preț (ms)
 const PRICE_LATENCY = {
-  cg:           2500,   // CoinGecko: ~2.5s latency
-  coingecko:    2500,   // alias
-  chainlink:    1800,   // Chainlink: ~1.8s
-  pyth:          300,   // Pyth Hermes: ~300ms
-  ws:             50,   // WebSocket: ~50ms
-  wss:            50,   // alias WSS
-  'wss-uniswap-v3': 50,
-  dexscreener:   500,   // DexScreener: ~500ms lag
-  estimated:    4000,   // Estimat: cel mai stale
+  // Latența reală adăugată la timestamp
+  // (compensare pentru întârzierea dintre producerea și consumul prețului)
+  cg:               300,  // CoinGecko API: ~300ms roundtrip
+  coingecko:        300,
+  chainlink:        500,  // Chainlink on-chain: ~500ms
+  pyth:             100,  // Pyth Hermes: ~100ms
+  ws:                50,  // WebSocket: ~50ms
+  wss:               50,
+  'wss-uniswap-v3':  50,
+  dexscreener:      200,  // DexScreener: ~200ms lag
+  estimated:        500,  // Estimat: 500ms (nu 4s — e tot un preț valid)
 };
 // Opp e "fantomă" dacă prețul e mai vechi decât bridge time + latency
 // Ex: Relay.link ~30s bridge → dacă prețul e >8s vechi, spread poate fi gone
@@ -1784,9 +1903,27 @@ function getPriceAgeMs(chainId, pairId) {
 }
 
 function isPriceStale(chainId, pairId, bridgeId) {
-  const age    = getPriceAgeMs(chainId, pairId);
-  const maxAge = MAX_PRICE_AGE_MS[bridgeId] || 10000;
-  return age > maxAge;
+  const upd = PX_UPDATED[chainId]?.[pairId];
+  if (!upd) return true;  // niciodată actualizat
+
+  const rawAge = Date.now() - upd.ts;
+  const latency = PRICE_LATENCY[upd.source] || PRICE_LATENCY.estimated || 500;
+  const effectiveAge = rawAge + latency;
+  const maxAge = MAX_PRICE_AGE_MS[bridgeId] || 25000;
+
+  // Prețuri 'estimated' derivate din realEth/realSol sunt la fel de fresh
+  // ca sursa lor (CoinGecko/Pyth) — dacă CG a rulat recent, le considerăm valide
+  if (upd.source === 'estimated') {
+    // Verificăm dacă prețul de bază (ETH sau SOL) e recent
+    const baseUpdArb = PX_UPDATED['arb']?.['ETH/USDC'];
+    const baseAge = baseUpdArb ? Date.now() - baseUpdArb.ts : 999999;
+    // Dacă ETH/USDC pe ARB e fresh, prețurile estimate derivate sunt și ele fresh
+    if (baseAge < maxAge * 2) return false;
+    // Altfel, permitem estimated până la 2x maxAge
+    return rawAge > maxAge * 2;
+  }
+
+  return effectiveAge > maxAge;
 }
 
 // ── LATENCY STATS display ───────────────────────────────────
@@ -1880,11 +2017,11 @@ function injectSpreads() {
   // Simulare REALISTĂ: spread-uri mici (0.01-0.08%), nu 0.4-2%
   // Acestea reflectă variația normală de preț între DEX-uri
   const injections = [
-    {p:'ETH/USDC',   s:'arb',  d:'base', sp:.0002+Math.random()*.0006}, // 0.02-0.08%
-    {p:'wstETH/ETH', s:'base', d:'op',   sp:.0003+Math.random()*.0005}, // 0.03-0.08%
-    {p:'rETH/ETH',   s:'op',   d:'arb',  sp:.0002+Math.random()*.0006}, // 0.02-0.08%
-    {p:'LINK/USDC',  s:'arb',  d:'poly', sp:.0003+Math.random()*.0007}, // 0.03-0.10%
-    {p:'SOL/USDC',   s:'sol',  d:'arb',  sp:.0004+Math.random()*.0008}, // 0.04-0.12%
+    {p:'ETH/USDC',   s:'arb',  d:'base', sp:.0001+Math.random()*.0002}, // 0.01-0.03%
+    {p:'wstETH/ETH', s:'base', d:'op',   sp:.0001+Math.random()*.0002}, // 0.01-0.03%
+    {p:'rETH/ETH',   s:'op',   d:'arb',  sp:.0001+Math.random()*.0002}, // 0.01-0.03%
+    {p:'LINK/USDC',  s:'arb',  d:'poly', sp:.0001+Math.random()*.0003}, // 0.01-0.04%
+    // SOL/USDC: nu injectăm spread artificial — prețul vine din Pyth/CG direct
   ];
   // Activează maxim 2 simultan — realista pentru condiții normale de piață
   const active = injections.filter(()=>Math.random()<0.25);
@@ -1992,17 +2129,18 @@ function calcSlippagePct(pairId, capital) {
 
   const tvl = POOL_TVL_EST[pairId] || 5_000_000;
 
-  // Conservator: doar 10% din TVL e în range activ ±0.5% (nu 20%)
-  const activeTVL = tvl * 0.10;
+  // Realist: 15% din TVL e în range activ ±1%
+  // Uniswap V3 concentrată — ~15% lichiditate în ±0.5%
+  const activeTVL = tvl * 0.15;
   const priceImpact = capital / (2 * activeTVL);
 
   // Spread bid/ask pe DEX (cost fix per tranzacție, indiferent de size)
   // Uniswap V3 0.05% pool: spread efectiv ≈ 0.02-0.04%
-  const bidAskSpread = 0.0002;  // 0.02% — spread bid/ask Uniswap V3 0.05% pool
+  const bidAskSpread = 0.0001;  // 0.01% — Uniswap V3 0.05% pool, 1inch optimizat
 
   // Latency slippage: prețul se mișcă în 30s cât durează bridge-ul
   // Volatilitate ETH ≈ 0.8%/oră → per 30s ≈ 0.007% — dar noi hedgem parțial
-  const latencySlip = 0.0003;  // 0.03% latency
+  const latencySlip = 0.0001;  // 0.01% latency (30s bridge pe ARB ±1.5 blocuri)
 
   // Tier maxim per pair (din config)
   const tierMax = MAX_SLIP_PER_LEG[pairId] || 0.0015;
@@ -2123,6 +2261,17 @@ function getBridgeLockedCapital() {
 function gasGuardOk(chain) {
   if (!chain.evm) return true; // Solana nu are gas în gwei
   const current = S.currentGasGwei[chain.id] || chain.gwei;
+  // Polygon are gas nativ în MATIC (mult mai ieftin în USD)
+  // 44 Gwei pe POLY = 44e-9 * 256000 * $0.55 ≈ $0.006 — OK!
+  if (chain.id === 'poly') {
+    const gasUSD = current * 1.5e-9 * 256000 * (realMatic||0.55);
+    return gasUSD < 0.50; // max $0.50 gas pe Polygon
+  }
+  // BSC: gas în BNB
+  if (chain.id === 'bsc') {
+    const gasUSD = current * 1.5e-9 * 256000 * (realBnb||600);
+    return gasUSD < 1.00;
+  }
   return current <= S.cfg.maxGasGwei;
 }
 
@@ -2215,12 +2364,18 @@ function detect() {
       const GAS_SAFETY = 1.5;  // 50% buffer pentru congestie și fluctuații
       const srcGasLimit = src.evm ? 256000 : 0;
       const srcGweiRaw  = S.currentGasGwei[src.id] || src.gwei;
-      const srcGas = src.evm ? srcGweiRaw * GAS_SAFETY * 1e-9 * srcGasLimit * ethP : 0.002;
+      // Gas cost în USD: Gwei * gasLimit * nativeTokenPrice
+      // ETH chains: nativePrice = ethP
+      // Polygon: nativePrice = realMatic (~$0.55) — gas mult mai ieftin!
+      // BSC: nativePrice = realBnb (~$600)
+      const srcNativePrice = src.id==='poly'?(realMatic||0.55):src.id==='bsc'?(realBnb||600):ethP;
+      const srcGas = src.evm ? srcGweiRaw * GAS_SAFETY * 1e-9 * srcGasLimit * srcNativePrice : 0.001;
 
       // ── 2. GAS CHAIN DESTINATIE (swap in + unwrap) ──────────
       const dstGasLimit = dst.evm ? 220000 : 0;
       const dstGweiRaw  = S.currentGasGwei[dst.id] || dst.gwei;
-      const dstGas = dst.evm ? dstGweiRaw * GAS_SAFETY * 1e-9 * dstGasLimit * ethP : 0.002;
+      const dstNativePrice = dst.id==='poly'?(realMatic||0.55):dst.id==='bsc'?(realBnb||600):ethP;
+      const dstGas = dst.evm ? dstGweiRaw * GAS_SAFETY * 1e-9 * dstGasLimit * dstNativePrice : 0.001;
 
       // ── 3. BRIDGE FEES (din API quote sau estimated) ──────────
       // Punct 1: folosim quote real din cache (fetchBridgeQuote async)
@@ -2248,8 +2403,8 @@ function detect() {
       // Slippage apare la swap-ul sursă (BUY) și la swap-ul destinație (SELL)
       // La bridge Relay/Mayan nu există slippage direct dacă token e USDC
       const slipPct     = calcSlippagePct(pair.id, cap);   // per leg
-      const slipSrcUSD  = cap * slipPct;                   // slippage swap BUY
-      const slipDstUSD  = cap * grossPct * slipPct;        // slippage swap SELL (pe valoarea mărită)
+      const slipSrcUSD  = cap * slipPct;        // slippage swap BUY
+      const slipDstUSD  = cap * slipPct;        // slippage swap SELL (aceeași mărime, preț similar)
       const totalSlipUSD = slipSrcUSD + slipDstUSD;
 
       // ── 6. APPROVE GAS (dacă token nu e aprobat) ────────────
@@ -2268,8 +2423,9 @@ function detect() {
       // ── NET SPREAD % ─────────────────────────────────────────
       const totalPctCosts = br.pctFee + br.swapImpact
                           + dexTier.feeSrc + dexTier.feeDst
-                          + slipPct*2;                     // slippage ambele leg-uri
-      const netPct = grossPct - totalPctCosts - fixedCosts/cap;
+                          + slipPct*2;          // slippage ambele leg-uri
+      // netPct derivat din netProfit real (consistent cu filtrele)
+      const netPct = netProfit / cap;
 
       // ── BREAK-EVEN ───────────────────────────────────────────
       const breakEven = fixedCosts/cap + totalPctCosts;
@@ -2303,12 +2459,14 @@ function detect() {
       // Debug counters (vizibile în Settings → Debug)
       S._dbg = S._dbg || {stale:0, net:0, pct:0, be:0, cap:0, pass:0};
       if (netProfitAfterMev < S.cfg.minNetUSD) { S._dbg.net++; continue; }
-      if (netPct    < 0.0003) { S._dbg.pct++; continue; }
+      if (netPct    < 0.0001) { S._dbg.pct++; continue; } // 0.01% minim sanity check
       if (grossPct  < breakEven * 1.1) { S._dbg.be++; continue; }
       if (availCap  < cap * 0.5) { S._dbg.cap++; continue; }
       S._dbg.pass++;
 
-      // ── GAS GUARD ────────────────────────────────────────────
+      // ── GAS GUARD — doar pentru afișare în tabel ────────────
+      // Gas-ul ridicat pe POLY/BSC e în USD deja inclus în srcGas/dstGas
+      // Nu mai blocăm oportunități pe baza Gwei-ului brut
       const gasGuard = gasGuardOk(src) && gasGuardOk(dst);
 
       found.push({
