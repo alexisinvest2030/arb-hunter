@@ -895,21 +895,21 @@ function minSpreadNeeded(br, capital, srcGas, dstGas, dexFees) {
 //  PAIRS — EVM + Solana + LINK
 // ══════════════════════════════════════════════════════════════
 const PAIRS = [
-  {id:'ETH/USDC',   base:2485,   type:'major', tag:'',    vol:.004, chains:['arb','base','op','poly','bsc'], label:'ETH/USDC'},
+  {id:'ETH/USDC',   base:2100,   type:'major', tag:'',    vol:.004, chains:['arb','base','op','poly','bsc'], label:'ETH/USDC'},
   {id:'wstETH/ETH', base:1.165,  type:'lst',   tag:'LST', vol:.003, chains:['arb','base','op'],        label:'wstETH/ETH'},
   {id:'rETH/ETH',   base:1.072,  type:'lst',   tag:'LST', vol:.003, chains:['arb','base','op'],        label:'rETH/ETH'},
   {id:'MAI/USDC',   base:.9985,  type:'stable',tag:'STBL',vol:.0015,chains:['arb','base','op','poly'], label:'MAI/USDC'},
   {id:'FRAX/USDC',  base:.9998,  type:'stable',tag:'STBL',vol:.0008,chains:['arb','base','op','poly'], label:'FRAX/USDC'},
   {id:'LUSD/USDC',  base:1.002,  type:'stable',tag:'STBL',vol:.002, chains:['arb','base','op'],        label:'LUSD/USDC'},
   {id:'LINK/USDC',  base:14.5,   type:'major', tag:'LINK',vol:.005, chains:['arb','base','op','poly','bsc'], label:'LINK/USDC'},
-  {id:'SOL/USDC',   base:155,    type:'major', tag:'SOL', vol:.006, chains:['sol','base','arb'],        label:'SOL/USDC'},
+  {id:'SOL/USDC',   base:140,    type:'major', tag:'SOL', vol:.006, chains:['sol','base','arb'],        label:'SOL/USDC'},
   {id:'JitoSOL/SOL',base:1.065,  type:'lst',   tag:'SOL', vol:.003, chains:['sol'],                    label:'JitoSOL/SOL'},
   {id:'mSOL/SOL',   base:1.058,  type:'lst',   tag:'SOL', vol:.003, chains:['sol'],                    label:'mSOL/SOL'},
   {id:'USDC/USDC',  base:1.000,  type:'stable',tag:'SOL', vol:.001, chains:['sol','arb','base','poly','bsc'], label:'USDC x-chain'},
   // ── PERECHI NOI ─────────────────────────────────────────────
   {id:'BNB/USDC',   base:600,    type:'major', tag:'BNB', vol:.005, chains:['bsc'],                     label:'BNB/USDC'},
   {id:'CAKE/USDC',  base:2.2,    type:'major', tag:'BSC', vol:.006, chains:['bsc'],                     label:'CAKE/USDC'},
-  {id:'ETH/USDT',   base:2485,   type:'major', tag:'',    vol:.004, chains:['bsc','arb','poly'],         label:'ETH/USDT'},
+  {id:'ETH/USDT',   base:2100,   type:'major', tag:'',    vol:.004, chains:['bsc','arb','poly'],         label:'ETH/USDT'},
   {id:'BTC/USDC',   base:69000,  type:'major', tag:'BTC', vol:.003, chains:['arb','base','bsc'],         label:'BTC/USDC'},
   {id:'MATIC/USDC', base:0.55,   type:'major', tag:'',    vol:.005, chains:['poly','arb','base'],        label:'MATIC/USDC'},
 ];
@@ -1436,12 +1436,60 @@ async function fetchCG() {
   $('lCG').textContent = 'CG: ⟳';
   $('lCG').style.color = 'var(--yellow)';
   try {
-    const r = await fetch(
-      'https://api.coingecko.com/api/v3/simple/price?ids=ethereum,solana,chainlink,wrapped-steth,rocket-pool-eth,mai,frax,liquity-usd,jito-staked-sol,msol,binancecoin,pancakeswap-token,bitcoin,matic-network&vs_currencies=usd&include_24hr_change=true',
-      {signal: AbortSignal.timeout(8000)}
-    );
-    if (!r.ok) throw new Error('HTTP '+r.status);
-    const d = await r.json();
+    // CoinGecko poate da CORS pe GitHub Pages — folosim mai multe surse
+    let d = null;
+
+    // Sursa 1: CoinGecko API direct (funcționează de obicei)
+    try {
+      const r = await fetch(
+        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum,solana,chainlink,wrapped-steth,rocket-pool-eth,mai,frax,liquity-usd,jito-staked-sol,msol,binancecoin,pancakeswap-token,bitcoin,matic-network&vs_currencies=usd&include_24hr_change=true',
+        { signal: AbortSignal.timeout(8000), mode: 'cors' }
+      );
+      if (r.ok) d = await r.json();
+    } catch(e1) {
+      log('WARN', 'CoinGecko direct: ' + e1.message + ' — încerc fallback');
+    }
+
+    // Sursa 2: CoinGecko v3 fără cache (alt endpoint)
+    if (!d) {
+      try {
+        const r2 = await fetch(
+          'https://api.coingecko.com/api/v3/simple/price?ids=ethereum%2Csolana%2Cchainlink%2Cbitcoin%2Cmatic-network%2Cbinancecoin&vs_currencies=usd&include_24hr_change=true&precision=6',
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (r2.ok) d = await r2.json();
+      } catch(e2) {
+        log('WARN', 'CoinGecko v2: ' + e2.message);
+      }
+    }
+
+    // Sursa 3: CryptoCompare — fără CORS, gratuit, fără API key
+    if (!d) {
+      try {
+        const r3 = await fetch(
+          'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=ETH,SOL,LINK,BTC,MATIC,BNB&tsyms=USD',
+          { signal: AbortSignal.timeout(8000) }
+        );
+        if (r3.ok) {
+          const cc = await r3.json();
+          const raw = cc.RAW || {};
+          // Normalizăm la formatul CoinGecko
+          d = {
+            ethereum:        { usd: raw.ETH?.USD?.PRICE, usd_24h_change: raw.ETH?.USD?.CHANGEPCT24HOUR },
+            solana:          { usd: raw.SOL?.USD?.PRICE, usd_24h_change: raw.SOL?.USD?.CHANGEPCT24HOUR },
+            chainlink:       { usd: raw.LINK?.USD?.PRICE, usd_24h_change: raw.LINK?.USD?.CHANGEPCT24HOUR },
+            bitcoin:         { usd: raw.BTC?.USD?.PRICE, usd_24h_change: raw.BTC?.USD?.CHANGEPCT24HOUR },
+            'matic-network': { usd: raw.MATIC?.USD?.PRICE, usd_24h_change: raw.MATIC?.USD?.CHANGEPCT24HOUR },
+            binancecoin:     { usd: raw.BNB?.USD?.PRICE, usd_24h_change: raw.BNB?.USD?.CHANGEPCT24HOUR },
+          };
+          log('SYS', '📊 Prețuri via CryptoCompare (fallback CoinGecko)');
+        }
+      } catch(e3) {
+        log('WARN', 'CryptoCompare: ' + e3.message);
+      }
+    }
+
+    if (!d) throw new Error('Toate sursele de prețuri au eșuat');
 
     realEth  = d.ethereum?.usd  || 2485;
     realSol  = d.solana?.usd    || 155;
@@ -1878,12 +1926,12 @@ const PRICE_LATENCY = {
 // Opp e "fantomă" dacă prețul e mai vechi decât bridge time + latency
 // Ex: Relay.link ~30s bridge → dacă prețul e >8s vechi, spread poate fi gone
 const MAX_PRICE_AGE_MS = {
-  relay:    8000,   // Relay 30s bridge → max 8s price age
-  mayan:    8000,
-  jumper:  15000,   // Jumper ~1min bridge → 15s ok
-  gaszip:  15000,
-  across:  20000,   // Across ~2min → 20s ok
-  stargate:30000,   // Stargate ~3min → 30s ok
+  relay:   25000,
+  mayan:   25000,
+  jumper:  40000,
+  gaszip:  40000,
+  across:  55000,
+  stargate:80000,
 };
 
 function markPriceUpdated(chainId, pairId, source) {
