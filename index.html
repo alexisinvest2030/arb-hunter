@@ -1439,57 +1439,41 @@ async function fetchCG() {
     // CoinGecko poate da CORS pe GitHub Pages — folosim mai multe surse
     let d = null;
 
-    // Sursa 1: CoinGecko API direct (funcționează de obicei)
+    // CoinGecko acum e folosit DOAR pentru: wstETH ratio, rETH ratio, CAKE, MAI, FRAX, LUSD
+    // ETH/SOL/BTC/BNB/MATIC/LINK vin din Pyth (mai rapid, fără CORS)
+    // Încercăm CoinGecko pentru ratiourile LST
     try {
       const r = await fetch(
-        'https://api.coingecko.com/api/v3/simple/price?ids=ethereum,solana,chainlink,wrapped-steth,rocket-pool-eth,mai,frax,liquity-usd,jito-staked-sol,msol,binancecoin,pancakeswap-token,bitcoin,matic-network&vs_currencies=usd&include_24hr_change=true',
+        'https://api.coingecko.com/api/v3/simple/price?ids=wrapped-steth,rocket-pool-eth,pancakeswap-token,mai,frax,liquity-usd,jito-staked-sol,msol&vs_currencies=usd',
         { signal: AbortSignal.timeout(8000), mode: 'cors' }
       );
       if (r.ok) d = await r.json();
     } catch(e1) {
-      log('WARN', 'CoinGecko direct: ' + e1.message + ' — încerc fallback');
+      // CoinGecko blocat de CORS (GitHub Pages) — folosim valori estimate
+      log('SYS', '📊 CoinGecko CORS — LST ratios estimate din prețuri Pyth');
     }
 
-    // Sursa 2: CoinGecko v3 fără cache (alt endpoint)
+    // Fallback minimal: construim d din prețurile Pyth deja disponibile
     if (!d) {
-      try {
-        const r2 = await fetch(
-          'https://api.coingecko.com/api/v3/simple/price?ids=ethereum%2Csolana%2Cchainlink%2Cbitcoin%2Cmatic-network%2Cbinancecoin&vs_currencies=usd&include_24hr_change=true&precision=6',
-          { signal: AbortSignal.timeout(8000) }
-        );
-        if (r2.ok) d = await r2.json();
-      } catch(e2) {
-        log('WARN', 'CoinGecko v2: ' + e2.message);
-      }
+      d = {
+        'wrapped-steth':    { usd: (realEth||2100) * 1.165 },
+        'rocket-pool-eth':  { usd: (realEth||2100) * 1.072 },
+        'pancakeswap-token':{ usd: realCake || 2.2 },
+        'mai':              { usd: 0.9985 },
+        'frax':             { usd: 0.9998 },
+        'liquity-usd':      { usd: 1.002 },
+        'jito-staked-sol':  { usd: (realSol||88) * 1.065 },
+        'msol':             { usd: (realSol||88) * 1.058 },
+      };
     }
 
-    // Sursa 3: CryptoCompare — fără CORS, gratuit, fără API key
-    if (!d) {
-      try {
-        const r3 = await fetch(
-          'https://min-api.cryptocompare.com/data/pricemultifull?fsyms=ETH,SOL,LINK,BTC,MATIC,BNB&tsyms=USD',
-          { signal: AbortSignal.timeout(8000) }
-        );
-        if (r3.ok) {
-          const cc = await r3.json();
-          const raw = cc.RAW || {};
-          // Normalizăm la formatul CoinGecko
-          d = {
-            ethereum:        { usd: raw.ETH?.USD?.PRICE, usd_24h_change: raw.ETH?.USD?.CHANGEPCT24HOUR },
-            solana:          { usd: raw.SOL?.USD?.PRICE, usd_24h_change: raw.SOL?.USD?.CHANGEPCT24HOUR },
-            chainlink:       { usd: raw.LINK?.USD?.PRICE, usd_24h_change: raw.LINK?.USD?.CHANGEPCT24HOUR },
-            bitcoin:         { usd: raw.BTC?.USD?.PRICE, usd_24h_change: raw.BTC?.USD?.CHANGEPCT24HOUR },
-            'matic-network': { usd: raw.MATIC?.USD?.PRICE, usd_24h_change: raw.MATIC?.USD?.CHANGEPCT24HOUR },
-            binancecoin:     { usd: raw.BNB?.USD?.PRICE, usd_24h_change: raw.BNB?.USD?.CHANGEPCT24HOUR },
-          };
-          log('SYS', '📊 Prețuri via CryptoCompare (fallback CoinGecko)');
-        }
-      } catch(e3) {
-        log('WARN', 'CryptoCompare: ' + e3.message);
-      }
-    }
-
-    if (!d) throw new Error('Toate sursele de prețuri au eșuat');
+    // Completăm cu prețurile Pyth (sursa principală)
+    if (!d.ethereum)        d.ethereum        = { usd: realEth  || 2100, usd_24h_change: 0 };
+    if (!d.solana)          d.solana          = { usd: realSol  || 88,   usd_24h_change: 0 };
+    if (!d.chainlink)       d.chainlink       = { usd: realLink || 9.2,  usd_24h_change: 0 };
+    if (!d.bitcoin)         d.bitcoin         = { usd: realBtc  || 67000,usd_24h_change: 0 };
+    if (!d.binancecoin)     d.binancecoin     = { usd: realBnb  || 600,  usd_24h_change: 0 };
+    if (!d['matic-network'])d['matic-network']= { usd: realMatic|| 0.55, usd_24h_change: 0 };
 
     realEth  = d.ethereum?.usd  || 2485;
     realSol  = d.solana?.usd    || 155;
@@ -1600,8 +1584,8 @@ async function fetchCG() {
     $('vSolC').textContent = (sc>=0?'+':'')+sc+'% 24h';
     setText('vLink','$'+realLink.toFixed(3));
 
-    $('lCG').textContent = 'CG: ✓';
-    $('lCG').style.color = 'var(--green)';
+    $('lCG').textContent = 'CG:LST';  // CG doar pentru LST ratios
+    $('lCG').style.color = 'var(--dim)';
     $('lPY').textContent = `PY:${realEth.toFixed(0)}`;
     $('lPY').style.color = 'var(--green)';
 
@@ -1845,6 +1829,10 @@ const PYTH_IDS = {
   ETH:  '0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace',
   SOL:  '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
   LINK: '0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221',
+  BTC:  '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43',
+  BNB:  '0x2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f',
+  MATIC:'0x5de33a9112c2b700b8d30b8a3402c103578ccfa2765696471cc672bd5cf6ac52',
+  WBTC: '0xc9d8b075a5c69303365ae23633d4e085199bf5c520a3b90fed1322a0342ffc33',
 };
 
 async function fetchPyth() {
@@ -1866,47 +1854,51 @@ async function fetchPyth() {
       const ageS = Math.floor(Date.now()/1000 - pubTime);
       out[sym] = { price, conf, ageS };
     }
+    // Helper: sync preț pe toate chain-urile
+    const syncPriceAllChains = (pairId, price, source) => {
+      if (!price || isNaN(price) || price <= 0) return;
+      CHAINS.forEach(ch => {
+        if (!PX[ch.id] || PX[ch.id][pairId] === undefined) return;
+        const dex = _dexPrices[ch.id]?.[pairId];
+        const dexAge = dex ? Date.now() - dex.ts : 99999;
+        if (dexAge > 15000) { // DEX stale → Pyth
+          PX[ch.id][pairId] = price;
+          markPriceUpdated(ch.id, pairId, source || 'pyth');
+        }
+      });
+      const pair = PAIRS.find(p => p.id === pairId);
+      if (pair) pair.base = price;
+    };
+
     if (out.ETH) {
       realEth = out.ETH.price;
       setText('vEth', '$'+realEth.toLocaleString());
-      // Sync ETH pe toate chain-urile dacă nu avem date DEX mai recente
-      CHAINS.forEach(ch => {
-        if (!PX[ch.id]) return;
-        const dex = _dexPrices[ch.id]?.['ETH/USDC'];
-        const dexAge = dex ? Date.now() - dex.ts : 99999;
-        if (dexAge > 20000) { // DEX mai vechi de 20s → folosim Pyth
-          PX[ch.id]['ETH/USDC'] = realEth;
-          PX[ch.id]['ETH/USDT'] = realEth;
-          markPriceUpdated(ch.id, 'ETH/USDC', 'pyth');
-          markPriceUpdated(ch.id, 'ETH/USDT', 'pyth');
-        }
-      });
+      syncPriceAllChains('ETH/USDC', realEth, 'pyth');
+      syncPriceAllChains('ETH/USDT', realEth, 'pyth');
     }
     if (out.SOL) {
       realSol = out.SOL.price;
       setText('vSol', '$'+realSol.toFixed(2));
-      // CRITIC: sync SOL pe TOATE chain-urile cu prețul Pyth
-      // DexScreener pe ARB/BASE returnează SOL stale — Pyth e sursa corectă
-      CHAINS.forEach(ch => {
-        if (!PX[ch.id] || PX[ch.id]['SOL/USDC'] === undefined) return;
-        PX[ch.id]['SOL/USDC'] = realSol;
-        markPriceUpdated(ch.id, 'SOL/USDC', 'pyth');
-      });
-      // Actualizăm și PAIRS base pentru consistență
-      const solPair = PAIRS.find(p => p.id === 'SOL/USDC');
-      if (solPair) solPair.base = realSol;
+      syncPriceAllChains('SOL/USDC', realSol, 'pyth');
     }
     if (out.LINK) {
       realLink = out.LINK.price;
       setText('vLink', '$'+realLink.toFixed(3));
-      // Sync LINK pe toate chain-urile
-      CHAINS.forEach(ch => {
-        if (!PX[ch.id] || PX[ch.id]['LINK/USDC'] === undefined) return;
-        PX[ch.id]['LINK/USDC'] = realLink;
-        markPriceUpdated(ch.id, 'LINK/USDC', 'pyth');
-      });
-      const linkPair = PAIRS.find(p => p.id === 'LINK/USDC');
-      if (linkPair) linkPair.base = realLink;
+      syncPriceAllChains('LINK/USDC', realLink, 'pyth');
+    }
+    if (out.BTC || out.WBTC) {
+      realBtc = (out.BTC || out.WBTC).price;
+      syncPriceAllChains('BTC/USDC', realBtc, 'pyth');
+      const btcPair = PAIRS.find(p => p.id === 'BTC/USDC');
+      if (btcPair) btcPair.base = realBtc;
+    }
+    if (out.BNB) {
+      realBnb = out.BNB.price;
+      syncPriceAllChains('BNB/USDC', realBnb, 'pyth');
+    }
+    if (out.MATIC) {
+      realMatic = out.MATIC.price;
+      syncPriceAllChains('MATIC/USDC', realMatic, 'pyth');
     }
 
     $('lPY').textContent = `PY:✓`;
@@ -5371,7 +5363,7 @@ async function init() {
 
   window._mainLoop = setInterval(mainLoop,  1500);
   window._tickClock = setInterval(tickClock, 1000);
-  setInterval(fetchCG,   55000);
+  setInterval(fetchCG, 120000);
   setInterval(fetchCL,   30000);
   setInterval(fetchPyth, 10000); // Pyth mai frecvent — sub-400ms latency
   setInterval(refreshGasPrices, 15000); // Refresh gas prices
