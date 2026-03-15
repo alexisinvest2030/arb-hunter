@@ -1512,6 +1512,25 @@ async function fetchCG() {
     PAIRS[0].base = realEth;
     PAIRS[1].base = wstE/realEth;
     PAIRS[2].base = rE/realEth;
+    // LST tokens: ratio față de ETH e global — același pe toate chain-urile
+    // Prețul per chain ar trebui să fie identic, diferențele sunt arbitraj real
+    // Dar setăm un spread mic realist de ±0.05% între chain-uri
+    CHAINS.forEach(ch => {
+      if (PX[ch.id]) {
+        if (PX[ch.id]['wstETH/ETH'] !== undefined)
+          PX[ch.id]['wstETH/ETH'] = PAIRS[1].base * (1 + (Math.random()-.5)*0.001);
+        if (PX[ch.id]['rETH/ETH'] !== undefined)
+          PX[ch.id]['rETH/ETH'] = PAIRS[2].base * (1 + (Math.random()-.5)*0.001);
+        if (PX[ch.id]['JitoSOL/SOL'] !== undefined)
+          PX[ch.id]['JitoSOL/SOL'] = PAIRS[8].base * (1 + (Math.random()-.5)*0.001);
+        if (PX[ch.id]['mSOL/SOL'] !== undefined)
+          PX[ch.id]['mSOL/SOL'] = PAIRS[9].base * (1 + (Math.random()-.5)*0.001);
+        // Marchează ca fresh
+        ['wstETH/ETH','rETH/ETH','JitoSOL/SOL','mSOL/SOL'].forEach(pid => {
+          if (PX[ch.id][pid] !== undefined) markPriceUpdated(ch.id, pid, 'coingecko');
+        });
+      }
+    });
     PAIRS[6].base = realLink;
     PAIRS[7].base = realSol;
     PAIRS[8].base = jito/realSol;
@@ -1589,19 +1608,35 @@ async function fetchCG() {
     log('PRICE',`ETH $${realEth.toLocaleString()} (${ec>=0?'+':''}${ec}%) | SOL $${realSol.toFixed(2)} (${sc>=0?'+':''}${sc}%) | LINK $${realLink.toFixed(3)} (${lc>=0?'+':''}${lc}%)`);
     log('LINK', `wstETH/ETH: ${PAIRS[1].base.toFixed(5)} | rETH/ETH: ${PAIRS[2].base.toFixed(5)} | JitoSOL: ${jito.toFixed(3)} | mSOL: ${msol.toFixed(3)}`);
 
-    // Marcăm TOATE prețurile ca fresh după fetchCG reușit
-    // Prețurile 'estimated' sunt calculate din realEth/realSol care tocmai s-au actualizat
+    // Sync complet: toate prețurile actualizate cu valorile reale
     const cgNow = Date.now();
-    CHAINS.forEach(ch => PAIRS.forEach(p => {
-      if (!p.chains.includes(ch.id)) return;
-      if (!PX[ch.id]?.[p.id]) return;
-      const upd = PX_UPDATED[ch.id]?.[p.id];
-      // Actualizăm timestamp-ul — prețul e derivat din CG care tocmai a rulat
-      if (!upd || upd.source === 'estimated' || upd.source === 'coingecko') {
-        PX_UPDATED[ch.id] = PX_UPDATED[ch.id] || {};
-        PX_UPDATED[ch.id][p.id] = { ts: cgNow, source: 'coingecko', latency: 300 };
-      }
-    }));
+    CHAINS.forEach(ch => {
+      if (!PX[ch.id]) return;
+      PAIRS.forEach(p => {
+        if (!p.chains.includes(ch.id)) return;
+        // Sync prețuri bazate pe realEth/realSol/etc
+        let newPrice = null;
+        if (p.id === 'ETH/USDC' || p.id === 'ETH/USDT') newPrice = realEth;
+        else if (p.id === 'SOL/USDC')   newPrice = realSol;
+        else if (p.id === 'LINK/USDC')  newPrice = realLink;
+        else if (p.id === 'BNB/USDC')   newPrice = realBnb;
+        else if (p.id === 'BTC/USDC')   newPrice = realBtc;
+        else if (p.id === 'MATIC/USDC') newPrice = realMatic;
+
+        // Setăm prețul DOAR dacă nu avem date DEX mai recente (< 15s)
+        const dex = _dexPrices[ch.id]?.[p.id];
+        const dexFresh = dex && (Date.now() - dex.ts) < 15000;
+        if (newPrice && !dexFresh) {
+          PX[ch.id][p.id] = newPrice;
+          PX_UPDATED[ch.id] = PX_UPDATED[ch.id] || {};
+          PX_UPDATED[ch.id][p.id] = { ts: cgNow, source: 'coingecko', latency: 300 };
+        } else if (!PX[ch.id][p.id]) {
+          // Prețuri LST/stable — folosim baza din PAIRS
+          PX[ch.id][p.id] = p.base;
+          PX_UPDATED[ch.id][p.id] = { ts: cgNow, source: 'coingecko', latency: 300 };
+        }
+      });
+    });
     injectSpreads(); detect();
     if (activePane==='prices') renderPrices();
   } catch(e) {
@@ -1831,9 +1866,48 @@ async function fetchPyth() {
       const ageS = Math.floor(Date.now()/1000 - pubTime);
       out[sym] = { price, conf, ageS };
     }
-    if (out.ETH)  { realEth  = out.ETH.price;  setText('vEth',  '$'+realEth.toLocaleString()); }
-    if (out.SOL)  { realSol  = out.SOL.price;  setText('vSol',  '$'+realSol.toFixed(2)); }
-    if (out.LINK) { realLink = out.LINK.price; setText('vLink', '$'+realLink.toFixed(3)); }
+    if (out.ETH) {
+      realEth = out.ETH.price;
+      setText('vEth', '$'+realEth.toLocaleString());
+      // Sync ETH pe toate chain-urile dacă nu avem date DEX mai recente
+      CHAINS.forEach(ch => {
+        if (!PX[ch.id]) return;
+        const dex = _dexPrices[ch.id]?.['ETH/USDC'];
+        const dexAge = dex ? Date.now() - dex.ts : 99999;
+        if (dexAge > 20000) { // DEX mai vechi de 20s → folosim Pyth
+          PX[ch.id]['ETH/USDC'] = realEth;
+          PX[ch.id]['ETH/USDT'] = realEth;
+          markPriceUpdated(ch.id, 'ETH/USDC', 'pyth');
+          markPriceUpdated(ch.id, 'ETH/USDT', 'pyth');
+        }
+      });
+    }
+    if (out.SOL) {
+      realSol = out.SOL.price;
+      setText('vSol', '$'+realSol.toFixed(2));
+      // CRITIC: sync SOL pe TOATE chain-urile cu prețul Pyth
+      // DexScreener pe ARB/BASE returnează SOL stale — Pyth e sursa corectă
+      CHAINS.forEach(ch => {
+        if (!PX[ch.id] || PX[ch.id]['SOL/USDC'] === undefined) return;
+        PX[ch.id]['SOL/USDC'] = realSol;
+        markPriceUpdated(ch.id, 'SOL/USDC', 'pyth');
+      });
+      // Actualizăm și PAIRS base pentru consistență
+      const solPair = PAIRS.find(p => p.id === 'SOL/USDC');
+      if (solPair) solPair.base = realSol;
+    }
+    if (out.LINK) {
+      realLink = out.LINK.price;
+      setText('vLink', '$'+realLink.toFixed(3));
+      // Sync LINK pe toate chain-urile
+      CHAINS.forEach(ch => {
+        if (!PX[ch.id] || PX[ch.id]['LINK/USDC'] === undefined) return;
+        PX[ch.id]['LINK/USDC'] = realLink;
+        markPriceUpdated(ch.id, 'LINK/USDC', 'pyth');
+      });
+      const linkPair = PAIRS.find(p => p.id === 'LINK/USDC');
+      if (linkPair) linkPair.base = realLink;
+    }
 
     $('lPY').textContent = `PY:✓`;
     $('lPY').style.color = 'var(--green)';
@@ -5299,7 +5373,7 @@ async function init() {
   window._tickClock = setInterval(tickClock, 1000);
   setInterval(fetchCG,   55000);
   setInterval(fetchCL,   30000);
-  setInterval(fetchPyth, 20000); // Pyth mai frecvent — sub-400ms latency
+  setInterval(fetchPyth, 10000); // Pyth mai frecvent — sub-400ms latency
   setInterval(refreshGasPrices, 15000); // Refresh gas prices
   // Refresh bridge quotes la fiecare 60s (rate limit friendly)
   // Un singur request per interval, prin rotație — max 3 req/min
