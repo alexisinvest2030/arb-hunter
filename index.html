@@ -1198,11 +1198,19 @@ setInterval(fetchExtraTokenPrices, 20000);
 
 // Pool-urile Uniswap V3 cu cel mai mare volum per chain (WETH/USDC 0.05%)
 const UNI_V3_POOLS = {
-  arb:  '0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443',
-  base: '0x6c561B446416E1A00E8E93E221854d6eA4171372',
-  op:   '0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b',
-  poly: '0x45dDa9cb7c25131DF268515131f647d726f50608',
-  bsc:  '0x6Fe9E9F653fD3E0E3d8f528B5A00Aff05f6A6aB7',  // PancakeSwap V3 ETH/USDT
+  // ETH/USDC Uniswap V3 0.05% — pool principal per chain
+  arb:  '0xC31E54c7a869B9FcBEcc14363CF510d1c41fa443',  // ARB ETH/USDC 0.05%
+  base: '0x4C36388bE6F416A29C8d8Eee81C771cE6bE14B5',  // BASE ETH/USDC 0.05% (Aerodrome)
+  op:   '0x1fb3cf6e48F1E7B10213E7b6d87D4c073C7Fdb7b',  // OP ETH/USDC 0.05%
+  poly: '0x45dDa9cb7c25131DF268515131f647d726f50608',  // POLY ETH/USDC 0.05%
+  bsc:  '0x6Fe9E9F653fD3E0E3d8f528B5A00Aff05f6A6aB7',  // BSC PancakeSwap V3 ETH/USDT
+};
+
+// Pool-uri LST pentru WSS suplimentar (wstETH/ETH, rETH/ETH)
+const LST_POOLS = {
+  wstETH_arb:  '0x35218a1cbaC5Bbc3E57fd9Bd38219D37571b3537',  // wstETH/ETH ARB
+  wstETH_base: '0x891A8CB9cE30710e78Ff2a684B700F47CbBc2Ef',  // wstETH/ETH BASE
+  rETH_arb:    '0x09ba302A3f5ad2bF8853266e271b005A5b3716fe',  // rETH/ETH ARB
 };
 
 // Solana — prețuri via Alchemy Solana WSS (logsSubscribe Jupiter aggregator)
@@ -1315,7 +1323,11 @@ function connectWssChain(chainId, poolAddr) {
       log('LIVE', `🔌 WSS ${chainId.toUpperCase()}: conectat la pool ${poolAddr.slice(0,10)}...`);
       // Actualizăm indicatorul AL din topbar
       const alEl = document.getElementById('lALCH');
-      if (alEl) { alEl.textContent = 'AL:WSS'; alEl.style.color = 'var(--green)'; }
+      if (alEl) {
+        const connCount = Object.keys(_wssConnections).filter(k => _wssConnections[k] && _wssConnections[k].readyState === 1).length;
+        alEl.textContent = 'AL:WSS(' + connCount + ')';
+        alEl.style.color = connCount >= 4 ? 'var(--green)' : 'var(--yellow)';
+      }
     };
 
     ws.onmessage = (event) => {
@@ -2003,17 +2015,18 @@ const PRICE_LATENCY = {
   wss:               50,
   'wss-uniswap-v3':  50,
   dexscreener:      200,  // DexScreener: ~200ms lag
-  estimated:        500,  // Estimat: 500ms (nu 4s — e tot un preț valid)
+  estimated:        300,  // Estimat: 500ms (nu 4s — e tot un preț valid)
 };
 // Opp e "fantomă" dacă prețul e mai vechi decât bridge time + latency
 // Ex: Relay.link ~30s bridge → dacă prețul e >8s vechi, spread poate fi gone
 const MAX_PRICE_AGE_MS = {
-  relay:   25000,
-  mayan:   25000,
-  jumper:  40000,
-  gaszip:  40000,
-  across:  55000,
-  stargate:80000,
+  // Arbitraj real: prețuri mai vechi de 3-8s = oportunitate dispărută
+  relay:    8000,  // Relay ~30s bridge — prețul sursă max 8s vechi
+  mayan:    8000,  // Mayan ~30s bridge
+  jumper:  12000,  // Jumper ~1min bridge
+  gaszip:  12000,
+  across:  20000,  // Across ~2min bridge
+  stargate:30000,  // Stargate ~3min bridge
 };
 
 function markPriceUpdated(chainId, pairId, source) {
@@ -4861,6 +4874,56 @@ function renderSettings() {
 
     <!-- TESTNET MODE ────────────────────────────────────────── -->
     \${renderTestnetPanel()}
+
+    <!-- GHID LIVE TRADING ─────────────────────────────────── -->
+    <div style="background:rgba(255,50,50,.04);border:1px solid rgba(255,50,50,.2);border-radius:6px;padding:10px;margin-bottom:10px">
+      <div style="font-size:9px;color:var(--red);letter-spacing:1px;margin-bottom:8px">&#128640; PAȘI PENTRU LIVE TRADING</div>
+      <div style="font-size:10px;line-height:1.9;color:var(--fg)">
+        <div>
+          <span style="color:${S.cfg.walletAddress?'#00ff96':'#ffcc00'}">
+            ${S.cfg.walletAddress ? '&#10003;' : '&#9312;'}
+          </span>
+          <b style="margin-left:6px">Adresă wallet</b>
+          <span style="color:var(--dim)"> — tab &#128176; BALAN&#354;E &#8594; paste 0x... &#8594; Live</span>
+        </div>
+        <div>
+          <span style="color:${S.cfg.alchemyKey?'#00ff96':'#ffcc00'}">
+            ${S.cfg.alchemyKey ? '&#10003;' : '&#9313;'}
+          </span>
+          <b style="margin-left:6px">Alchemy Key</b>
+          <span style="color:var(--dim)"> — alchemy.com gratuit &#8594; WSS real-time pe toate 6 chain-uri</span>
+        </div>
+        <div>
+          <span style="color:${_pkWallet?'#00ff96':'#ffcc00'}">
+            ${_pkWallet ? '&#10003;' : '&#9314;'}
+          </span>
+          <b style="margin-left:6px">Private Key (auto-sign)</b>
+          <span style="color:var(--dim)"> — wallet dedicat cu capital limitat, f&#259;r&#259; popup MetaMask</span>
+        </div>
+        <div>
+          <span style="color:${S.cfg.oneInchKey?'#00ff96':'#ffcc00'}">
+            ${S.cfg.oneInchKey ? '&#10003;' : '&#9315;'}
+          </span>
+          <b style="margin-left:6px">1inch API Key</b>
+          <span style="color:var(--dim)"> — portal.1inch.dev gratuit &#8594; swap calldata pentru execu&#539;ie</span>
+        </div>
+        <div>
+          <span style="color:#4488ff">&#9316;</span>
+          <b style="margin-left:6px">Testnet 24h</b>
+          <span style="color:var(--dim)"> — activeaz&#259; mai jos Arbitrum Sepolia &#8594; verific&#259; c&#259; tranzac&#539;iile se confirm&#259;</span>
+        </div>
+        <div>
+          <span style="color:#4488ff">&#9317;</span>
+          <b style="margin-left:6px">LIVE MODE</b>
+          <span style="color:var(--dim)"> — click pe <b>SIM</b> din header &#8594; confirm&#259; &#8594; primele 3 trades manual, apoi Auto-Execute</span>
+        </div>
+      </div>
+      <div style="margin-top:8px;padding:7px;background:rgba(255,200,0,.08);border-radius:4px;font-size:9px;color:#ffcc00">
+        &#9888; Perechi recomandate pentru &#238;nceput: <b>ETH/USDC ARB&#8596;BASE</b> (cel mai lichid) &#183;
+        <b>wstETH/ETH</b> (spread stabil) &#183; <b>SOL/USDC ARB&#8596;SOL</b> (spread mare)<br>
+        Capital minim recomandat: <b>$500+</b> per trade (costurile fixe ~$0.46 fac profit sub $500 improbabil)
+      </div>
+    </div>
 
     <!-- DEBUG DETECT() ──────────────────────────────────────── --><!-- DEBUG DETECT() ──────────────────────────────────────── -->
     <div style="background:rgba(255,200,0,.04);border:1px solid rgba(255,200,0,.15);border-radius:6px;padding:10px;margin-bottom:10px">
