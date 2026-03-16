@@ -549,7 +549,8 @@ const S = {
     minNetUSD:  0.30,  // $0.30 minim — break-even real ARB→BASE ≈$0.46, deci spread minim 0.15% — suficient să filtreze noise, suficient de mic să vadă opps reale
     circuitBreaker: false, // auto-set when price source fails
     // ── Alchemy API Keys ────────────────────────────────────────
-    alchemyKey: 'xP6sNWNG29sPnx7XogQqV',  // Alchemy API key — WSS + RPC
+    alchemyKey:    'xP6sNWNG29sPnx7XogQqV',  // Alchemy API key — WSS + RPC
+    walletAddress: '',   // Adresă publică ETH pentru balanțe (fără MetaMask)
     oneInchKey: '',
     heliusKey:  '',
     mockMode:   true,   // TEST MODE — balante mock, fără wallet necesar
@@ -4716,45 +4717,102 @@ function renderWalletTab() {
 }
 
 
+
+function loadBalancesLive() {
+  var a = (document.getElementById('walletAddrInput') || {}).value || '';
+  a = a.trim();
+  if (!a || !a.startsWith('0x')) { log('WARN', 'Adresă invalidă — trebuie să înceapă cu 0x'); return; }
+  S.cfg.walletAddress = a;
+  S.wallet.evmAddress = a;
+  S.cfg.mockMode = false;
+  log('SYS', '⏳ Încarc balanțe live...');
+  loadLiveBalances(a).then(function() { switchPane('balances'); }).catch(function(e){ log('ERR','Balance: '+e.message); });
+}
+
+function loadBalancesMock() {
+  S.cfg.mockMode = true;
+  loadMockBalances();
+  switchPane('balances');
+}
+
+function refreshBalances() {
+  var a = S.cfg.walletAddress || S.wallet.evmAddress;
+  if (a) {
+    log('SYS', '🔄 Refresh balanțe...');
+    loadLiveBalances(a).then(function(){ switchPane('balances'); });
+  } else {
+    loadMockBalances();
+    switchPane('balances');
+  }
+}
+
+
+
+
+
 function renderBalancesPane() {
-  const el = document.getElementById('balancesPaneContent');
+  var el = document.getElementById('settingsContent');
   if (!el) return;
-
-  // Header cu butoane de acțiune
-  const isMock = S.cfg.mockMode;
-  const addr = S.wallet.evmAddress;
-
-  el.innerHTML = '<div style="max-width:800px;margin:0 auto">'
-
-    // ── Header ──────────────────────────────────────────────
-    + '<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:12px">'
-    + '<div style="font-size:13px;font-weight:bold;color:var(--fg)">💰 Balanțe per Chain</div>'
-    + '<div style="display:flex;gap:6px">'
-    + '<button onclick="toggleMockMode(true);renderBalancesPane()" style="padding:4px 10px;background:'+(isMock?'rgba(255,200,0,.25)':'rgba(255,255,255,.05)')+';border:1px solid '+(isMock?'#ffcc00':'var(--brd)')+';border-radius:4px;color:'+(isMock?'#ffcc00':'var(--dim)')+';cursor:pointer;font-size:10px">🧪 Mock</button>'
-    + '<button onclick="toggleMockMode(false);if(S.wallet.evmAddress)loadLiveBalances(S.wallet.evmAddress);renderBalancesPane()" style="padding:4px 10px;background:'+(!isMock?'rgba(0,150,255,.2)':'rgba(255,255,255,.05)')+';border:1px solid '+(!isMock?'#4488ff':'var(--brd)')+';border-radius:4px;color:'+(!isMock?'#4488ff':'var(--dim)')+';cursor:pointer;font-size:10px">📡 Live</button>'
-    + '<button onclick="'+(isMock?'loadMockBalances()':'(S.wallet.evmAddress&&loadLiveBalances(S.wallet.evmAddress))')+';setTimeout(renderBalancesPane,500)" style="padding:4px 10px;background:rgba(0,255,150,.1);border:1px solid #00ff96;border-radius:4px;color:#00ff96;cursor:pointer;font-size:10px">↺ Refresh</button>'
-    + '</div></div>'
-
-    // ── Status wallet ────────────────────────────────────────
-    + '<div style="background:rgba(255,255,255,.03);border:1px solid var(--brd);border-radius:6px;padding:8px 12px;margin-bottom:10px;font-size:10px;display:flex;justify-content:space-between;align-items:center">'
-    + '<div>'
-    + (addr
-        ? '<span style="color:#00ff96">✓ MetaMask: '+addr.slice(0,8)+'...'+addr.slice(-4)+'</span>'
-        : '<span style="color:var(--dim)">○ Wallet neconectat — afișez '+(isMock?'balanțe simulate':'date demo')+'</span>')
-    + '</div>'
-    + '<div style="color:var(--dim);font-size:9px">'+( isMock ? '🧪 MOD TEST' : '📡 LIVE VIA ALCHEMY')+'</div>'
-    + '</div>'
-
-    // ── Tabel balanțe ────────────────────────────────────────
-    + renderBalancePanel()
-
-    // ── WSS Status ───────────────────────────────────────────
-    + renderWssStatusPanel()
-
-    // ── Dacă nu e conectat, arătăm instrucțiuni ─────────────
-    + (!addr && !isMock ? renderMetaMaskFileBanner() : '')
-
-    + '</div>';
+  var addr = S.cfg.walletAddress || S.wallet.evmAddress || '';
+  var isMock = S.cfg.mockMode;
+  var chains = [
+    {id:'arb', label:'Arbitrum',color:'#28A0F0',native:'ETH',  nKey:'eth',  px:function(){return realEth||2100;}},
+    {id:'base',label:'Base',    color:'#0052FF',native:'ETH',  nKey:'eth',  px:function(){return realEth||2100;}},
+    {id:'op',  label:'Optimism',color:'#FF0420',native:'ETH',  nKey:'eth',  px:function(){return realEth||2100;}},
+    {id:'poly',label:'Polygon', color:'#8247E5',native:'MATIC',nKey:'matic',px:function(){return realMatic||0.55;}},
+    {id:'bsc', label:'BSC',     color:'#F0B90B',native:'BNB',  nKey:'bnb',  px:function(){return realBnb||600;}},
+    {id:'sol', label:'Solana',  color:'#9945FF',native:'SOL',  nKey:'sol',  px:function(){return realSol||88;}},
+  ];
+  var tot = chains.reduce(function(s,ch){var b=S.wallet.balances[ch.id];return b&&b.loaded?s+(b[ch.nKey]||0)*ch.px()+(b.usdc||0):s;},0);
+  var totUSDC = chains.reduce(function(s,ch){var b=S.wallet.balances[ch.id];return s+(b&&b.usdc||0);},0);
+  var rows = chains.map(function(ch){
+    var b=S.wallet.balances[ch.id],loaded=!!(b&&b.loaded),mock=!!(b&&b.mock);
+    var nv=loaded?(b[ch.nKey]||0)*ch.px():0,uv=loaded?(b.usdc||0):0,tot2=nv+uv;
+    var lat=S.wsLatency[ch.id],lc=(!lat&&lat!==0)?'var(--dim)':lat<200?'#00ff96':lat<500?'#ffcc00':'#ff4444';
+    return '<tr style="border-bottom:1px solid rgba(255,255,255,.06)">'
+      +'<td style="padding:8px"><span style="width:10px;height:10px;border-radius:50%;background:'+ch.color+';display:inline-block;margin-right:7px;vertical-align:middle"></span>'
+      +'<b>'+ch.label+'</b>'+(mock?' <span style="color:#ffcc00;font-size:9px;border:1px solid #ffcc00;padding:1px 4px;border-radius:3px">M</span>':'')+'</td>'
+      +'<td style="padding:8px;text-align:right;color:#4fd1ff">'+(loaded?(b[ch.nKey]||0).toFixed(4)+' '+ch.native:'--')+'</td>'
+      +'<td style="padding:8px;text-align:right;color:#00cc88;font-weight:bold">'+(loaded?'$'+(b.usdc||0).toFixed(2):'--')+'</td>'
+      +'<td style="padding:8px;text-align:right;color:var(--fg)">'+(loaded?'$'+tot2.toFixed(2):'--')+'</td>'
+      +'<td style="padding:8px;text-align:right;font-size:10px;color:'+lc+'">'+(lat!=null?lat+'ms':'--')+'</td>'
+      +'</tr>';
+  }).join('');
+  var usdcWarn = totUSDC>0&&totUSDC<S.cfg.capital
+    ? ' <span style="color:#ffcc00">&#9888; USDC $'+totUSDC.toFixed(0)+' < Capital $'+S.cfg.capital+'</span>'
+    : totUSDC>0?' <span style="color:#00ff96">&#10003; OK</span>':'';
+  el.innerHTML = '<div style="padding:12px;max-width:700px">'
+    +'<div style="background:rgba(0,210,255,.06);border:1px solid rgba(0,210,255,.2);border-radius:8px;padding:12px;margin-bottom:14px">'
+    +'<div style="font-size:9px;color:var(--cyan);letter-spacing:1px;margin-bottom:8px">&#128225; ADRESA WALLET - BALANTE READ-ONLY</div>'
+    +'<div style="display:flex;gap:8px;margin-bottom:6px">'
+    +'<input id="walletAddrInput" type="text" placeholder="0x... adresa ta ETH publica" value="'+addr+'"'
+    +' style="flex:1;background:var(--bg2);border:1px solid var(--brd);border-radius:5px;padding:7px 10px;color:var(--fg);font-size:11px;font-family:monospace"'
+    +' oninput="S.cfg.walletAddress=this.value.trim()">'
+    +'<button onclick="loadBalancesLive()" style="padding:7px 14px;background:rgba(0,210,255,.15);border:1px solid var(--cyan);border-radius:5px;color:var(--cyan);cursor:pointer;font-size:11px">&#128225; Live</button>'
+    +'<button onclick="loadBalancesMock()" style="padding:7px 10px;background:rgba(255,200,0,.1);border:1px solid #ffcc00;border-radius:5px;color:#ffcc00;cursor:pointer;font-size:11px">&#129514; Mock</button>'
+    +'</div>'
+    +'<div style="font-size:9px;color:var(--dim)">Adresa publica ETH (0x...). Read-only via Alchemy - fara MetaMask.</div>'
+    +'</div>'
+    +'<div style="display:flex;align-items:center;justify-content:space-between;margin-bottom:10px">'
+    +'<div><span style="font-size:11px;color:var(--dim)">Total: </span>'
+    +'<span style="font-size:20px;font-weight:bold;color:'+(tot>0?'#00ff96':'var(--fg)')+'">$'+tot.toFixed(2)+'</span>'
+    +(isMock?' <span style="color:#ffcc00;font-size:10px">&#129514; MOCK</span>':'')
+    +'</div>'
+    +'<button onclick="refreshBalances()" style="padding:6px 14px;background:rgba(0,255,150,.1);border:1px solid #00ff96;border-radius:5px;color:#00ff96;cursor:pointer;font-size:11px">&#8635; Refresh</button>'
+    +'</div>'
+    +'<div style="background:var(--bg2);border:1px solid var(--brd);border-radius:8px;overflow:hidden;margin-bottom:10px">'
+    +'<table style="width:100%;border-collapse:collapse">'
+    +'<thead><tr style="background:rgba(255,255,255,.04);font-size:9px;color:var(--dim);letter-spacing:1px">'
+    +'<th style="padding:8px;text-align:left">CHAIN</th>'
+    +'<th style="padding:8px;text-align:right">NATIVE</th>'
+    +'<th style="padding:8px;text-align:right">USDC</th>'
+    +'<th style="padding:8px;text-align:right">TOTAL</th>'
+    +'<th style="padding:8px;text-align:right">RPC</th>'
+    +'</tr></thead><tbody>'+rows+'</tbody></table></div>'
+    +(tot>0?'<div style="background:rgba(0,255,150,.04);border:1px solid rgba(0,255,150,.15);border-radius:6px;padding:10px;font-size:11px">'
+      +'USDC total: <b style="color:#00cc88">$'+totUSDC.toFixed(2)+'</b>'
+      +' | Capital/trade: <b style="color:var(--cyan)">$'+S.cfg.capital+'</b>'+usdcWarn+'</div>':'')
+    +'</div>';
 }
 
 function renderSettings() {
