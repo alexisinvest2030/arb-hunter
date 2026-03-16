@@ -910,7 +910,7 @@ const PAIRS = [
   {id:'BNB/USDC',   base:600,    type:'major', tag:'BNB', vol:.005, chains:['bsc'],                     label:'BNB/USDC'},
   {id:'CAKE/USDC',  base:2.2,    type:'major', tag:'BSC', vol:.006, chains:['bsc'],                     label:'CAKE/USDC'},
   {id:'ETH/USDT',   base:2100,   type:'major', tag:'',    vol:.004, chains:['bsc','arb','poly'],         label:'ETH/USDT'},
-  {id:'BTC/USDC',   base:69000,  type:'major', tag:'BTC', vol:.003, chains:['arb','base','bsc'],         label:'BTC/USDC'},
+  {id:'WBTC/USDC',   base:69000,  type:'major', tag:'BTC', vol:.003, chains:['arb','base','bsc'],         label:'BTC/USDC'},
   {id:'MATIC/USDC', base:0.55,   type:'major', tag:'',    vol:.005, chains:['poly','arb','base'],        label:'MATIC/USDC'},
 ];
 
@@ -940,7 +940,7 @@ function initPrices() {
     'USDC/USDC':   1.000,
     'BNB/USDC':    realBnb  || 600,
     'CAKE/USDC':   realCake || 2.2,
-    'BTC/USDC':    realBtc  || 65000,
+    'WBTC/USDC':    realBtc  || 65000,
     'MATIC/USDC':  realMatic|| 0.50,
   };
   CHAINS.forEach(ch => {
@@ -1432,6 +1432,21 @@ function startSolanaWss() {
 }
 
 
+
+async function fetchBtcBnbMatic() {
+  try {
+    const r = await fetch(
+      'https://min-api.cryptocompare.com/data/pricemulti?fsyms=BTC,BNB,MATIC&tsyms=USD',
+      { signal: AbortSignal.timeout(5000) }
+    );
+    if (!r.ok) return;
+    const d = await r.json();
+    if (d.BTC?.USD)   { realBtc   = d.BTC.USD;   syncPriceAllChains('WBTC/USDC', realBtc,   'coingecko'); }
+    if (d.BNB?.USD)   { realBnb   = d.BNB.USD;   syncPriceAllChains('BNB/USDC',  realBnb,   'coingecko'); }
+    if (d.MATIC?.USD) { realMatic = d.MATIC.USD;  syncPriceAllChains('MATIC/USDC',realMatic, 'coingecko'); }
+  } catch(e) { /* silențios */ }
+}
+
 async function fetchCG() {
   $('lCG').textContent = 'CG: ⟳';
   $('lCG').style.color = 'var(--yellow)';
@@ -1604,7 +1619,7 @@ async function fetchCG() {
         else if (p.id === 'SOL/USDC')   newPrice = realSol;
         else if (p.id === 'LINK/USDC')  newPrice = realLink;
         else if (p.id === 'BNB/USDC')   newPrice = realBnb;
-        else if (p.id === 'BTC/USDC')   newPrice = realBtc;
+        else if (p.id === 'WBTC/USDC')  newPrice = realBtc;
         else if (p.id === 'MATIC/USDC') newPrice = realMatic;
 
         // Setăm prețul DOAR dacă nu avem date DEX mai recente (< 15s)
@@ -1826,29 +1841,20 @@ async function fetchCL() {
 //  Fallback secundar după Chainlink
 // ══════════════════════════════════════════════════════════════
 const PYTH_IDS = {
-  // ID-uri verificate pe pyth.network/developers/price-feed-ids
+  // Doar ID-uri verificate — ETH/SOL/LINK sunt stabile pe Pyth Hermes v2
   ETH:  '0xff61491a931112ddf1bd8147cd1b641375f79f5825126d665480874634fd0ace',
   SOL:  '0xef0d8b6fda2ceba41da15d4095d1da392a0d2f8ed0c6c7bc0f4cfac8c280b56d',
   LINK: '0x8ac0c70fff57e9aefdf5edf44b51d62c2d433653cbb2cf5cc06bb115af04d221',
-  BTC:  '0xe62df6c8b4a85fe1a67db44dc12de5db330f7ac66b72dc658afedf0f4a415b43',
-  BNB:  '0x2f95862b045670cd22bee3114c39763a4a08beeb663b145d283c31d7d1101c4f',
-  MATIC:'0x5de33a9112c2b700b8d30b8a3402c103578ccfa2765696471cc672bd5cf6ac52',
-  // WBTC eliminat — același preț ca BTC, nu are feed separat pe Pyth mainnet
+  // BTC/BNB/MATIC vin din CryptoCompare (fără CORS, mai fiabil)
 };
 
 async function fetchPyth() {
   try {
-    // Facem 2 requesturi separate: core (ETH/SOL/LINK) + extended (BTC/BNB/MATIC)
-    // Dacă extended pică, core continuă să funcționeze
-    const coreIds = ['ETH','SOL','LINK'];
-    const extIds  = ['BTC','BNB','MATIC'];
-
-    const buildUrl = keys => 'https://hermes.pyth.network/v2/updates/price/latest?'
-      + keys.map(k => `ids[]=${PYTH_IDS[k]}`).filter(Boolean).join('&')
+    // Request Pyth: ETH/SOL/LINK — ID-uri stabile, fără 404
+    const pythUrl = 'https://hermes.pyth.network/v2/updates/price/latest?'
+      + Object.values(PYTH_IDS).map(id => 'ids[]=' + id).join('&')
       + '&encoding=base64&parsed=true';
-
-    // Request core — obligatoriu
-    const resp = await fetch(buildUrl(coreIds), {signal: AbortSignal.timeout(5000)});
+    const resp = await fetch(pythUrl, {signal: AbortSignal.timeout(5000)});
     if (!resp.ok) throw new Error('HTTP '+resp.status);
     const data = await resp.json();
     const out = {};
@@ -1895,7 +1901,7 @@ async function fetchPyth() {
     }
     if (out.BTC || out.WBTC) {
       realBtc = (out.BTC || out.WBTC).price;
-      syncPriceAllChains('BTC/USDC', realBtc, 'pyth');
+      syncPriceAllChains('WBTC/USDC', realBtc, 'pyth');
       const btcPair = PAIRS.find(p => p.id === 'BTC/USDC');
       if (btcPair) btcPair.base = realBtc;
     }
@@ -1908,24 +1914,7 @@ async function fetchPyth() {
       syncPriceAllChains('MATIC/USDC', realMatic, 'pyth');
     }
 
-    // Request extended (BTC/BNB/MATIC) — opțional, nu blochează
-    try {
-      const buildUrl2 = keys => 'https://hermes.pyth.network/v2/updates/price/latest?'
-        + keys.filter(k => PYTH_IDS[k]).map(k => `ids[]=${PYTH_IDS[k]}`).join('&')
-        + '&encoding=base64&parsed=true';
-      const resp2 = await fetch(buildUrl2(extIds), {signal: AbortSignal.timeout(4000)});
-      if (resp2.ok) {
-        const data2 = await resp2.json();
-        for (const p of (data2.parsed||[])) {
-          const sym = Object.keys(PYTH_IDS).find(k => PYTH_IDS[k] === ('0x'+p.id.replace(/^0x/,'')));
-          if (!sym) continue;
-          const price = Number(p.price.price) * Math.pow(10, p.price.expo);
-          if (sym === 'BTC')   { realBtc   = price; syncPriceAllChains('BTC/USDC',   price, 'pyth'); }
-          if (sym === 'BNB')   { realBnb   = price; syncPriceAllChains('BNB/USDC',   price, 'pyth'); }
-          if (sym === 'MATIC') { realMatic = price; syncPriceAllChains('MATIC/USDC', price, 'pyth'); }
-        }
-      }
-    } catch(e) { /* extended Pyth opțional — ignorăm eroarea */ }
+    // BTC/BNB/MATIC vin din CryptoCompare via fetchCG
 
     $('lPY').textContent = `PY:✓`;
     $('lPY').style.color = 'var(--green)';
@@ -2196,7 +2185,7 @@ const DEX_FEES = {
   'BNB/USDC':    { stable:false, feeSrc:0.0025, feeDst:0.0025 }, // PancakeSwap V2 0.25%
   'CAKE/USDC':   { stable:false, feeSrc:0.0025, feeDst:0.0025 },
   'ETH/USDT':    { stable:false, feeSrc:0.0005, feeDst:0.0005 }, // PancakeSwap V3 0.05%
-  'BTC/USDC':    { stable:false, feeSrc:0.0005, feeDst:0.0005 },
+  'WBTC/USDC':    { stable:false, feeSrc:0.0005, feeDst:0.0005 },
   'MATIC/USDC':  { stable:false, feeSrc:0.0005, feeDst:0.0005 },
 };
 
@@ -2223,7 +2212,7 @@ const POOL_TVL_EST = {
   'BNB/USDC':    80_000_000,
   'CAKE/USDC':   10_000_000,
   'ETH/USDT':    25_000_000,
-  'BTC/USDC':    30_000_000,
+  'WBTC/USDC':    30_000_000,
   'MATIC/USDC':  20_000_000,
 };
 
@@ -2250,7 +2239,7 @@ const MAX_SLIP_PER_LEG = {
   'BNB/USDC':   0.0008,   // PancakeSwap V3 — lichid
   'CAKE/USDC':  0.0015,   // mai puțin lichid
   'ETH/USDT':   0.0005,   // similar ETH/USDC
-  'BTC/USDC':   0.0005,   // WBTC/USDC
+  'WBTC/USDC':   0.0005,   // WBTC/USDC
   'MATIC/USDC': 0.0010,   // volatil
 };
 
@@ -3818,9 +3807,13 @@ async function loadLiveBalances(address) {
   // Solana
   try {
     const t0Sol = Date.now();
+    // api.mainnet-beta.solana.com → 403 rate limit
+    // Folosim: Alchemy dacă avem key, altfel publicnode (gratuit, fără rate limit)
     const solRpc = S.cfg.heliusKey
-      ? 'https://mainnet.helius-rpc.com/?api-key='+S.cfg.heliusKey
-      : 'https://api.mainnet-beta.solana.com';
+      ? 'https://mainnet.helius-rpc.com/?api-key=' + S.cfg.heliusKey
+      : S.cfg.alchemyKey
+        ? 'https://solana-mainnet.g.alchemy.com/v2/' + S.cfg.alchemyKey
+        : 'https://solana.publicnode.com';
     const solAddr = S.wallet.solAddress || address; // folosim adresa Phantom dacă există
     const r = await fetch(solRpc, {
       method:'POST', headers:{'Content-Type':'application/json'},
